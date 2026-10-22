@@ -128,7 +128,7 @@ class BusinessRepository {
       );
       await ref.set(business.toCreateMap());
       return ref.id;
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to add the business.'),
         code: e.code,
@@ -144,7 +144,7 @@ class BusinessRepository {
   Future<void> updateBusiness(Business business) async {
     try {
       await _businesses.doc(business.id).update(business.toUpdateMap());
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to save the business.'),
         code: e.code,
@@ -160,7 +160,7 @@ class BusinessRepository {
   Future<void> deleteBusiness(String businessId) async {
     try {
       await _businesses.doc(businessId).delete();
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to delete the business.'),
         code: e.code,
@@ -204,7 +204,7 @@ class BusinessRepository {
             'userName': userName.trim(),
             'createdAt': FieldValue.serverTimestamp(),
           });
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to submit the rating.'),
         code: e.code,
@@ -280,7 +280,7 @@ class BusinessRepository {
             'status': 'Pending',
             'requestedAt': FieldValue.serverTimestamp(),
           });
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to submit the request.'),
         code: e.code,

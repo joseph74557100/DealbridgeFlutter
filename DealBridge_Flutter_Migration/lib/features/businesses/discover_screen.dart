@@ -1,19 +1,23 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/constants/app_constants.dart';
-import '../../../core/theme/app_colors.dart';
-import '../../../core/widgets/state_message.dart';
-import '../data/business_repository.dart';
-import '../models/business.dart';
-import '../widgets/business_card.dart';
+import '../../core/constants/app_constants.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/widgets/state_message.dart';
+import 'data/business_repository.dart';
+import 'models/business.dart';
+import 'widgets/business_card.dart';
 import 'business_details_screen.dart';
+import 'business_form_screen.dart';
 
 /// The business directory: search, category filtering and saved businesses.
 class DiscoverScreen extends StatefulWidget {
-  const DiscoverScreen({super.key, this.initialTab = 0});
+  const DiscoverScreen({super.key, this.initialTab = 0, this.repository});
 
-  /// 0 = directory, 1 = saved.
+  /// 0 = directory, 1 = saved, 2 = my businesses.
   final int initialTab;
+
+  /// Overrides the repository, which keeps the screen testable.
+  final BusinessRepository? repository;
 
   @override
   State<DiscoverScreen> createState() => _DiscoverScreenState();
@@ -21,9 +25,10 @@ class DiscoverScreen extends StatefulWidget {
 
 class _DiscoverScreenState extends State<DiscoverScreen>
     with SingleTickerProviderStateMixin {
-  final _repository = BusinessRepository();
+  late final BusinessRepository _repository =
+      widget.repository ?? BusinessRepository();
   late final TabController _tabs = TabController(
-    length: 2,
+    length: 3,
     vsync: this,
     initialIndex: widget.initialTab,
   );
@@ -61,6 +66,7 @@ class _DiscoverScreenState extends State<DiscoverScreen>
           tabs: const [
             Tab(text: 'Directory'),
             Tab(text: 'Saved'),
+            Tab(text: 'Mine'),
           ],
         ),
       ),
@@ -75,7 +81,17 @@ class _DiscoverScreenState extends State<DiscoverScreen>
             onCategoryChanged: (value) => setState(() => _category = value),
           ),
           _SavedTab(repository: _repository),
+          _MyBusinessesTab(repository: _repository),
         ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => Navigator.of(context).push(
+          MaterialPageRoute<bool>(
+            builder: (_) => const BusinessFormScreen(),
+          ),
+        ),
+        icon: const Icon(Icons.add_business_outlined),
+        label: const Text('Add business'),
       ),
     );
   }
@@ -251,6 +267,67 @@ class _SavedTab extends StatelessWidget {
                   ),
                 );
               },
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// The businesses owned by the signed-in user.
+class _MyBusinessesTab extends StatelessWidget {
+  const _MyBusinessesTab({required this.repository});
+
+  final BusinessRepository repository;
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<Business>>(
+      stream: repository.watchMyBusinesses(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return const StateMessage.error(
+            title: 'Could not load your businesses',
+            subtitle: 'Check your connection and try again.',
+          );
+        }
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final businesses = snapshot.data ?? const <Business>[];
+        if (businesses.isEmpty) {
+          return StateMessage.empty(
+            title: 'No businesses yet',
+            subtitle:
+                'Add a business so other members can send you deal proposals.',
+            action: FilledButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute<bool>(
+                  builder: (_) => const BusinessFormScreen(),
+                ),
+              ),
+              icon: const Icon(Icons.add),
+              label: const Text('Add business'),
+            ),
+          );
+        }
+
+        return ListView.separated(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+          itemCount: businesses.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 10),
+          itemBuilder: (context, index) {
+            final business = businesses[index];
+            return BusinessCard(
+              business: business,
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) =>
+                      BusinessDetailsScreen(businessId: business.id),
+                ),
+              ),
             );
           },
         );

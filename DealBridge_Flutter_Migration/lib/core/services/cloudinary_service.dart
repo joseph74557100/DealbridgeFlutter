@@ -43,7 +43,7 @@ class CloudinaryException implements Exception {
 /// The client never holds a Cloudinary API secret: deletions go through the
 /// `deleteCloudinaryMedia` callable instead.
 class CloudinaryService {
-  const CloudinaryService({http.Client? client})
+  CloudinaryService({http.Client? client})
       : _client = client ?? http.Client();
 
   final http.Client _client;

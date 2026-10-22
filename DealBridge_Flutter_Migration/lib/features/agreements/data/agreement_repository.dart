@@ -83,7 +83,7 @@ class AgreementRepository {
 
     try {
       await _agreements.doc(agreementId).update(updates);
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to update the agreement.'),
         code: e.code,
@@ -115,7 +115,7 @@ class AgreementRepository {
   Future<void> delete(String agreementId) async {
     try {
       await _agreements.doc(agreementId).delete();
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to delete the agreement.'),
         code: e.code,

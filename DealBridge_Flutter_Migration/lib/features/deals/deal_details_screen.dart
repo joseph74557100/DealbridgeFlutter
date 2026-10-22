@@ -1,18 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
-import '../../../core/constants/app_constants.dart';
-import '../../../core/services/functions_service.dart';
-import '../../../core/theme/app_colors.dart';
-import '../../../core/utils/app_exception.dart';
-import '../../../core/utils/app_formatters.dart';
-import '../../../core/widgets/state_message.dart';
-import '../../agreements/data/agreement_repository.dart';
-import '../../agreements/agreement_details_screen.dart';
-import '../../businesses/data/business_repository.dart';
-import '../data/deal_repository.dart';
-import '../models/deal.dart';
-import '../widgets/deal_card.dart';
+import '../../core/constants/app_constants.dart';
+import '../../core/services/functions_service.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/utils/app_exception.dart';
+import '../../core/utils/app_formatters.dart';
+import '../../core/widgets/state_message.dart';
+import '../agreements/data/agreement_repository.dart';
+import '../agreements/agreement_details_screen.dart';
+import '../businesses/data/business_repository.dart';
+import 'data/deal_repository.dart';
+import 'models/deal.dart';
+import 'widgets/deal_card.dart';
 
 class DealDetailsScreen extends StatefulWidget {
   const DealDetailsScreen({super.key, required this.dealId});
@@ -25,7 +25,6 @@ class DealDetailsScreen extends StatefulWidget {
 
 class _DealDetailsScreenState extends State<DealDetailsScreen> {
   final _repository = DealRepository();
-  final _agreements = AgreementRepository();
   final _functions = FunctionsService();
 
   bool _busy = false;
@@ -48,8 +47,8 @@ class _DealDetailsScreenState extends State<DealDetailsScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text('Something went wrong. Please try again.'),
+        const SnackBar(
+          content: Text('Something went wrong. Please try again.'),
           backgroundColor: AppColors.danger,
         ),
       );
@@ -123,6 +122,15 @@ class _DealDetailsScreenState extends State<DealDetailsScreen> {
     );
   }
 
+  Future<void> _hideDeal() async {
+    await _run(
+      () => _repository.hideDeal(widget.dealId),
+      'Deal hidden from your list.',
+    );
+    if (!mounted) return;
+    Navigator.of(context).pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -131,15 +139,7 @@ class _DealDetailsScreenState extends State<DealDetailsScreen> {
         actions: [
           IconButton(
             tooltip: 'Hide deal',
-            onPressed: _busy
-                ? null
-                : () async {
-                    await _run(
-                      () => _repository.hideDeal(widget.dealId),
-                      'Deal hidden from your list.',
-                    );
-                    if (mounted) Navigator.of(context).pop();
-                  },
+            onPressed: _busy ? null : _hideDeal,
             icon: const Icon(Icons.visibility_off_outlined),
           ),
         ],

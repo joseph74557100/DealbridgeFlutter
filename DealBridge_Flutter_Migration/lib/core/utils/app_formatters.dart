@@ -6,7 +6,7 @@ import 'package:intl/intl.dart';
 abstract final class AppFormatters {
   static final DateFormat _date = DateFormat('dd MMM yyyy');
   static final DateFormat _dateTime = DateFormat('dd MMM yyyy HH:mm');
-  static final DateFormat _time = DateFormat('hh:mm AM/PM');
+  static final DateFormat _time = DateFormat('hh:mm a');
 
   static String date(DateTime value) => _date.format(value.toLocal());
 

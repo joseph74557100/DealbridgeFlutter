@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/services/functions_service.dart';
-import '../../../core/utils/app_exception.dart';
-import '../../../core/utils/validators.dart';
-import '../data/auth_repository.dart';
+import '../../core/services/functions_service.dart';
+import '../../core/utils/app_exception.dart';
+import '../../core/utils/validators.dart';
+import 'data/auth_repository.dart';
 
 /// Password recovery.
 ///
@@ -109,7 +109,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   }
 
   Future<void> _sendEmail() async {
-    if (!Validators.email(_email.text.trim()) == null) {
+    if (Validators.email(_email.text.trim()) != null) {
       setState(() => _error = 'Enter a valid email address.');
       return;
     }

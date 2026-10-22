@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/theme/app_colors.dart';
-import '../../../core/utils/app_exception.dart';
-import '../../../core/utils/validators.dart';
-import '../data/auth_repository.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/utils/app_exception.dart';
+import '../../core/utils/validators.dart';
+import 'data/auth_repository.dart';
 import 'register_screen.dart';
 import 'forgot_password_screen.dart';
 

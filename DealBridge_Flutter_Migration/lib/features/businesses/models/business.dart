@@ -146,6 +146,50 @@ class Business {
     };
   }
 
+  /// Copies the business with the given fields replaced.
+  Business copyWith({
+    String? name,
+    String? category,
+    String? city,
+    String? description,
+    String? phone,
+    String? email,
+    String? website,
+    String? logoUrl,
+    String? logoPublicId,
+    List<String>? gallery,
+    List<String>? galleryPublicIds,
+  }) {
+    return Business(
+      id: id,
+      ownerId: ownerId,
+      name: name ?? this.name,
+      category: category ?? this.category,
+      city: city ?? this.city,
+      description: description ?? this.description,
+      phone: phone ?? this.phone,
+      email: email ?? this.email,
+      website: website ?? this.website,
+      logoUrl: logoUrl ?? this.logoUrl,
+      logoPublicId: logoPublicId ?? this.logoPublicId,
+      gallery: gallery ?? this.gallery,
+      galleryPublicIds: galleryPublicIds ?? this.galleryPublicIds,
+      verified: verified,
+      rating: rating,
+      ratingCount: ratingCount,
+      promoted: promoted,
+      followersCount: followersCount,
+      createdAt: createdAt,
+      verificationStatus: verificationStatus,
+      verificationLevel: verificationLevel,
+      trustScore: trustScore,
+      completedDeals: completedDeals,
+      disputeCount: disputeCount,
+      reportCount: reportCount,
+      businessStatus: businessStatus,
+    );
+  }
+
   static int _int(dynamic value) {
     if (value is int) return value;
     if (value is num) return value.toInt();

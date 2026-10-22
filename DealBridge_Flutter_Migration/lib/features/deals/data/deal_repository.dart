@@ -3,6 +3,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 
 import '../../../core/constants/app_constants.dart';
 import '../../../core/services/firebase_service.dart';
+import '../../../core/services/functions_service.dart';
 import '../../../core/utils/app_exception.dart';
 import '../../../core/utils/app_formatters.dart';
 import '../../../core/utils/firestore_errors.dart';
@@ -14,12 +15,20 @@ import '../models/deal.dart';
 /// `PENDING`, `ACCEPTED` and `DECLINED`. Server-authoritative states
 /// (`COMPLETED`, `CANCELLED`, `EXPIRED`) are reached through Cloud Functions.
 class DealRepository {
-  DealRepository({FirebaseFirestore? firestore, FirebaseAuth? auth})
-      : _db = firestore ?? FirebaseService.firestore,
-        _auth = auth ?? FirebaseService.auth;
+  DealRepository({
+    FirebaseFirestore? firestore,
+    FirebaseAuth? auth,
+    FunctionsService? functions,
+  })  : _db = firestore ?? FirebaseService.firestore,
+        _auth = auth ?? FirebaseService.auth,
+        _functions = functions;
 
   final FirebaseFirestore _db;
   final FirebaseAuth _auth;
+
+  /// Optional so the repository can be built without a Firebase Functions
+  /// instance in tests. It is resolved lazily on first use.
+  final FunctionsService? _functions;
 
   String get _uid => _auth.currentUser?.uid ?? '';
 
@@ -168,7 +177,7 @@ class DealRepository {
       return id;
     } on AppException {
       rethrow;
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, 'Unable to create the deal.'),
         code: e.code,
@@ -280,11 +289,15 @@ class DealRepository {
   }
 
   /// Cancels a deal through the trusted backend.
+  ///
+  /// Cancellation is server-authoritative: the Cloud Function validates that
+  /// the caller participates in the deal and that the deal is still
+  /// cancellable before it performs the terminal transition to `CANCELLED`.
   Future<void> cancelDeal(String dealId) async {
-    await _update(deal.id, <String, dynamic>{
-      'status': DealStatus.cancelled,
-      'lastActivityAt': _now(),
-    }, 'Unable to cancel the deal.');
+    if (dealId.isEmpty) {
+      throw const AppException('Unable to cancel the deal.');
+    }
+    await (_functions ?? FunctionsService()).cancelDeal(dealId);
   }
 
   // ---------------------------------------------------------------------
@@ -335,7 +348,7 @@ class DealRepository {
   ) async {
     try {
       await _deals.doc(dealId).update(updates);
-    } on FirebaseFirestoreException catch (e) {
+    } on FirebaseException catch (e) {
       throw AppException(
         firestoreErrorMessage(e, fallbackMessage),
         code: e.code,

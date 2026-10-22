@@ -202,7 +202,11 @@ class Agreement {
   }
 
   /// The readable creation date.
-  String? get createdLabel => AppFormatters.fromEpoch(createdAt) ?? createdDate;
+  String? get createdLabel {
+    final fromEpoch = AppFormatters.fromEpoch(createdAt);
+    if (fromEpoch != null) return fromEpoch;
+    return createdDate.isEmpty ? null : createdDate;
+  }
 
   static int _int(dynamic value) {
     if (value is int) return value;

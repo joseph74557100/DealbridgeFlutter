@@ -125,8 +125,7 @@ class FunctionsService {
       final result = await _functions.httpsCallable(name).call<Map<String, dynamic>>(
         payload,
       );
-      final data = result.data ?? const <String, dynamic>{};
-      return parse(data);
+      return parse(result.data);
     } on FirebaseFunctionsException catch (e) {
       throw AppException(
         e.message ?? _friendlyCode(e.code),

@@ -7,3 +7,11 @@ build/
 local.properties
 *.iml
 .idea/
+
+# Generated files
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+android/.gradle/
+android/local.properties

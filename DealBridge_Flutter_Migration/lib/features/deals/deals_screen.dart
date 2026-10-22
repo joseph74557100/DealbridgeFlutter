@@ -1,24 +1,28 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
-import '../../../core/constants/app_constants.dart';
-import '../../../core/theme/app_colors.dart';
-import '../../../core/widgets/state_message.dart';
-import '../data/deal_repository.dart';
-import '../models/deal.dart';
-import '../widgets/deal_card.dart';
+import '../../core/constants/app_constants.dart';
+import '../../core/theme/app_colors.dart';
+import '../../core/utils/firestore_errors.dart';
+import '../../core/widgets/state_message.dart';
+import 'data/deal_repository.dart';
+import 'models/deal.dart';
+import 'widgets/deal_card.dart';
 import 'deal_details_screen.dart';
 import 'propose_deal_screen.dart';
 
 class DealsScreen extends StatefulWidget {
-  const DealsScreen({super.key});
+  const DealsScreen({super.key, this.repository});
+
+  /// Overrides the repository, which keeps the screen testable.
+  final DealRepository? repository;
 
   @override
   State<DealsScreen> createState() => _DealsScreenState();
 }
 
 class _DealsScreenState extends State<DealsScreen> {
-  final _repository = DealRepository();
+  late final DealRepository _repository = widget.repository ?? DealRepository();
   String _filter = 'All';
 
   @override
@@ -79,7 +83,10 @@ class _DealsScreenState extends State<DealsScreen> {
                 if (snapshot.hasError) {
                   return StateMessage.error(
                     title: 'Could not load deals',
-                    subtitle: firestoreHint(snapshot.error),
+                    subtitle: firestoreErrorMessage(
+                      snapshot.error!,
+                      'Check your connection and Firestore permissions.',
+                    ),
                     action: FilledButton(
                       onPressed: () => setState(() {}),
                       child: const Text('Retry'),
@@ -137,13 +144,8 @@ class _DealsScreenState extends State<DealsScreen> {
 
 /// A short, safe hint for Firestore failures.
 String firestoreHint(Object? error) {
-  final text = error?.toString() ?? '';
-  if (text.toLowerCase().contains('permission')) {
-    return 'Your account does not have permission to read these deals.';
-  }
-  if (text.toLowerCase().contains('network') ||
-      text.toLowerCase().contains('socket')) {
-    return 'Network error. Check your connection and try again.';
-  }
-  return 'Check your connection and Firestore permissions.';
+  return firestoreErrorMessage(
+    error ?? 'Unknown error',
+    'Check your connection and Firestore permissions.',
+  );
 }
