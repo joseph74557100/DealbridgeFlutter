@@ -1,0 +1,1 @@
+Migrate personal/business conversations, messages, media upload/download, read state, presence, notifications and local cache from the existing Kotlin repositories. Validate every Firestore query against the existing rules.

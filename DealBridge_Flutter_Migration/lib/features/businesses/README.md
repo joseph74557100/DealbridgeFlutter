@@ -1,0 +1,1 @@
+Business discovery, business profiles, editing, saved businesses, follows and verification are to be migrated from the Kotlin repositories in the source inventory. Keep Firestore document field names compatible with the existing backend.

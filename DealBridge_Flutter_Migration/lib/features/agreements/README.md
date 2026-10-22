@@ -1,0 +1,1 @@
+Migrate agreement lookup by real agreementId, in-app PDF display, optional save to Downloads, and completed-deal vault. Do not restore signature or QR confirmation screens. Confirm the backend completion workflow before wiring actions.

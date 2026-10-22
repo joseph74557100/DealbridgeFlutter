@@ -1,0 +1,44 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ------------------------------------------------------------------
+    // Overview.
+    // ------------------------------------------------------------------
+    // All media uploads (profile images, business logos, newsfeed images,
+    // stories, chat media, support images, PDFs) go through Cloudinary via
+    // CloudinaryRepository. The Android client NEVER writes to Firebase
+    // Storage, and the backend never reads or writes the default bucket
+    // either.
+    //
+    // Firebase Storage here is a READ-ONLY legacy fallback: ProfileAvatar
+    // reads "profile_images/{userId}.jpg" and BusinessCard reads
+    // "business_logos/{businessId}.jpg" only when the Cloudinary URL is
+    // missing (accounts created before the Cloudinary migration).
+    //
+    // Rules:
+    //   * Signed-in users may READ the two legacy paths above.
+    //   * No list access anywhere (no bucket directory enumeration).
+    //   * No writes anywhere (uploads are performed by Cloudinary, not by
+    //     the app or by the default bucket).
+    //   * Every other object is denied by the final catch-all.
+
+    match /profile_images/{userId}.jpg {
+      // Legacy avatar fallback; visible to any signed-in platform user.
+      allow read: if request.auth != null;
+    }
+
+    match /business_logos/{businessId}.jpg {
+      // Legacy business logo fallback; visible to any signed-in platform
+      // user (logo shows on business cards and in the directory).
+      allow read: if request.auth != null;
+    }
+
+    // ------------------------------------------------------------------
+    // Deny everything else, including all writes and any list operations.
+    // ------------------------------------------------------------------
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

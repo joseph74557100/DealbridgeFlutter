@@ -1,0 +1,46 @@
+package com.example.dealbridge.data.model
+
+data class Business(
+    val id: String = "",
+    val ownerId: String = "",
+    val name: String = "",
+    val category: String = "",
+    val city: String = "",
+    val description: String = "",
+    val phone: String = "",
+    val email: String = "",
+    val website: String = "",
+    val logoUrl: String = "",
+    val logoPublicId: String = "",
+    val gallery: List<String> = emptyList(),
+    val galleryPublicIds: List<String> = emptyList(),
+    val verified: Boolean = false,
+    val rating: Float = 0f,
+    // Number of individual ratings behind `rating` (server-maintained so the
+    // average is meaningful). Clients can never write this value.
+    val ratingCount: Int = 0,
+    val promoted: Boolean = false,
+    val followersCount: Int = 0,
+    val createdAt: Long = System.currentTimeMillis(),
+    val verificationStatus: String = "Not Verified",
+    // Server-calculated verification level: 0=None, 1=Basic, 2=Verified, 3=Premium.
+    // Only settable by Cloud Functions — clients cannot modify this value.
+    val verificationLevel: Int = 0,
+    // Server-calculated trust score (0–100). Based on completed deals, disputes,
+    // reports, business age, and verification level. Only settable by Cloud Functions.
+    val trustScore: Int = 50,
+    // Server-maintained counters for trust score calculation.
+    val completedDeals: Int = 0,
+    val disputeCount: Int = 0,
+    val reportCount: Int = 0
+) {
+    /**
+     * Whether this business is genuinely verified (server-confirmed).
+     * The verified badge is shown ONLY when both [verified] is true AND
+     * [verificationLevel] is at least 1 (Basic). This prevents spoofed
+     * verification from showing a badge.
+     */
+    fun isGenuinelyVerified(): Boolean {
+        return verified && verificationLevel >= 1
+    }
+}

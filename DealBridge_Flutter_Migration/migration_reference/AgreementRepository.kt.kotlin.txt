@@ -1,0 +1,419 @@
+package com.example.dealbridge.data
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import com.example.dealbridge.data.model.AgreementStatus
+import com.example.dealbridge.data.model.DealAgreement
+import com.example.dealbridge.firebase.AuthRepository
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
+import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+object AgreementRepository {
+
+    private const val COLLECTION = "agreements"
+
+    private val db = FirebaseFirestore.getInstance()
+
+    private var appContext: Context? = null
+
+    fun init(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    private val _agreements = MutableStateFlow<List<DealAgreement>>(emptyList())
+    val agreementsFlow: StateFlow<List<DealAgreement>> = _agreements.asStateFlow()
+
+    // Tracks participantIds from SIGNED agreements for deal rule filtering.
+    // A completed deal/agreement must NOT be shown as a new deal opportunity
+    // to the same businesses/users who were already parties to that deal.
+    private val _signedAgreementParticipantIds = MutableStateFlow<Set<String>>(emptySet())
+    val signedAgreementParticipantIds: StateFlow<Set<String>> = _signedAgreementParticipantIds.asStateFlow()
+
+    // Client-side content hash verification results, keyed by agreement ID.
+    // Updated whenever agreements are loaded or refreshed.
+    private val _verificationResults = MutableStateFlow<Map<String, ContentHashVerifier.VerificationResult>>(emptyMap())
+    val verificationResults: StateFlow<Map<String, ContentHashVerifier.VerificationResult>> = _verificationResults.asStateFlow()
+
+    private var registration: ListenerRegistration? = null
+
+    // UI-facing callbacks always run on the main thread so Compose state,
+    // navigation and Toasts are never touched from a background thread.
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private fun runOnMain(block: () -> Unit) {
+        mainHandler.post(block)
+    }
+
+    val agreements: List<DealAgreement>
+        get() = _agreements.value
+
+    fun currentBusinessId(): String {
+        val userId = AuthRepository.currentUser()?.uid.orEmpty()
+        val myBusiness = BusinessRepository.businesses.firstOrNull { it.ownerId == userId }
+        return myBusiness?.id ?: userId
+    }
+
+    fun currentBusinessName(): String {
+        val userId = AuthRepository.currentUser()?.uid.orEmpty()
+        val myBusiness = BusinessRepository.businesses.firstOrNull { it.ownerId == userId }
+        return myBusiness?.name ?: "Your Business"
+    }
+
+    /**
+     * Gets the current user's business ID with a Firestore fallback.
+     * Use this in coroutines when BusinessRepository might not be loaded yet.
+     */
+    suspend fun getCurrentBusinessId(): String {
+        val userId = AuthRepository.currentUser()?.uid.orEmpty()
+        if (userId.isBlank()) return userId
+
+        // First try the local cache
+        val myBusiness = BusinessRepository.businesses.firstOrNull { it.ownerId == userId }
+        if (myBusiness != null) return myBusiness.id
+
+        // Fallback to Firestore query
+        return try {
+            val query = db.collection("businesses")
+                .whereEqualTo("ownerId", userId)
+                .limit(1)
+                .get()
+                .await()
+
+            query.documents.firstOrNull()?.id ?: userId
+        } catch (e: Exception) {
+            userId
+        }
+    }
+
+    /**
+     * Gets the current user's business name with a Firestore fallback.
+     * Use this in coroutines when BusinessRepository might not be loaded yet.
+     */
+    suspend fun getCurrentBusinessName(): String {
+        val userId = AuthRepository.currentUser()?.uid.orEmpty()
+        if (userId.isBlank()) return "Your Business"
+
+        // First try the local cache
+        val myBusiness = BusinessRepository.businesses.firstOrNull { it.ownerId == userId }
+        if (myBusiness != null) return myBusiness.name
+
+        // Fallback to Firestore query
+        return try {
+            val query = db.collection("businesses")
+                .whereEqualTo("ownerId", userId)
+                .limit(1)
+                .get()
+                .await()
+
+            query.documents.firstOrNull()?.getString("name") ?: "Your Business"
+        } catch (e: Exception) {
+            "Your Business"
+        }
+    }
+
+    private fun updateLocal(agreement: DealAgreement) {
+        val index = _agreements.value.indexOfFirst { it.id == agreement.id }
+        _agreements.value = if (index == -1) {
+            listOf(agreement) + _agreements.value
+        } else {
+            _agreements.value.toMutableList().apply {
+                this[index] = agreement
+            }
+        }
+    }
+
+    // Fix: use update() with whitelisted keys only (matches firestore.rules agreements update rule:
+    // status, notes, attachments, pdfUrl, fileId, fileName, localPdfPath, expiryDate, updatedBy, driveStatus).
+    // Full set() would overwrite server-authoritative fields (signatures, locks, hashes) and be denied.
+    fun saveToFirestore(
+        agreement: DealAgreement,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        if (agreement.id.isBlank()) {
+            runOnMain { onError("Unable to save agreement: missing agreement ID") }
+            return
+        }
+
+        // Whitelisted metadata only — fileName/driveStatus are part of the rules whitelist;
+        // they have no local model field so they are preserved on the server (omitted here, not cleared).
+        val updates = hashMapOf<String, Any>(
+            "status" to agreement.status,
+            "updatedBy" to agreement.updatedBy,
+            "notes" to agreement.notes,
+            "attachments" to agreement.attachments,
+            "pdfUrl" to agreement.pdfUrl,
+            "fileId" to agreement.fileId,
+            "localPdfPath" to agreement.localPdfPath,
+            "expiryDate" to agreement.expiryDate
+            // "fileName" and "driveStatus" remain server-managed via Drive upload flow; omitted to preserve them.
+        )
+
+        db.collection(COLLECTION).document(agreement.id).get()
+            .addOnSuccessListener { snap ->
+                val task = if (snap.exists()) db.collection(COLLECTION).document(agreement.id).update(updates)
+                else db.collection(COLLECTION).document(agreement.id).set(updates)
+                task.addOnSuccessListener { runOnMain { onSuccess() } }
+                    .addOnFailureListener { runOnMain { onError(it.message ?: "Unable to save agreement") } }
+            }
+            .addOnFailureListener { runOnMain { onError(it.message ?: "Unable to save agreement") } }
+    }
+
+    /**
+     * Observes the agreements collection in real time and keeps
+     * [agreementsFlow] scoped to the signed-in user's agreements.
+     * Also updates [signedAgreementParticipantIds] for deal rule filtering.
+     */
+    fun startListening() {
+        if (registration != null) return
+
+        val uid = AuthRepository.currentUser()?.uid
+        if (uid.isNullOrBlank()) return
+
+        try {
+            registration = db.collection(COLLECTION)
+                .whereArrayContains("participantIds", uid)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null || snapshot == null) return@addSnapshotListener
+
+                    val loaded = snapshot.documents
+                        .mapNotNull { document ->
+                            try {
+                                val agreement = document.toObject(DealAgreement::class.java)
+                                    ?: return@mapNotNull null
+                                if (agreement.id.isBlank()) {
+                                    agreement.copy(id = document.id)
+                                } else {
+                                    agreement
+                                }
+                            } catch (e: Exception) {
+                                Log.w(
+                                    "AgreementRepository",
+                                    "Skipping malformed agreement document ${document.id}",
+                                    e
+                                )
+                                null
+                            }
+                        }
+                        .distinctBy { it.id }
+                        .sortedByDescending { it.createdAt }
+
+                    _agreements.value = loaded
+
+                    // Verify content hashes for all loaded agreements
+                    verifyAllAgreements()
+
+                    // Update signed agreement participantIds for deal rule filtering
+                    val signedParticipantIds = loaded
+                        .filter { it.status == AgreementStatus.SIGNED }
+                        .flatMap { it.participantIds }
+                        .toSet()
+                    _signedAgreementParticipantIds.value = signedParticipantIds
+                }
+        } catch (e: Exception) {
+            Log.w("AgreementRepository", "Unable to start agreement listener", e)
+        }
+    }
+
+    fun stopListening() {
+        registration?.remove()
+        registration = null
+        _agreements.value = emptyList()
+        _verificationResults.value = emptyMap()
+    }
+
+    /**
+     * Verifies the content hash of a single agreement and caches the result.
+     * Returns the verification result.
+     */
+    fun verifyAgreement(agreement: DealAgreement): ContentHashVerifier.VerificationResult {
+        val result = ContentHashVerifier.verify(agreement)
+        _verificationResults.value = _verificationResults.value + (agreement.id to result)
+        return result
+    }
+
+    /**
+     * Verifies all loaded agreements' content hashes and caches the results.
+     */
+    fun verifyAllAgreements() {
+        val results = mutableMapOf<String, ContentHashVerifier.VerificationResult>()
+        for (agreement in _agreements.value) {
+            results[agreement.id] = ContentHashVerifier.verify(agreement)
+        }
+        _verificationResults.value = results
+    }
+
+    /**
+     * Returns the cached verification result for an agreement, or computes
+     * and caches it if not yet available.
+     */
+    fun getVerificationResult(agreementId: String): ContentHashVerifier.VerificationResult {
+        _verificationResults.value[agreementId]?.let { return it }
+        val agreement = _agreements.value.firstOrNull { it.id == agreementId }
+            ?: return ContentHashVerifier.VerificationResult(
+                status = ContentHashVerifier.VerificationStatus.HASH_NOT_AVAILABLE,
+                storedHash = "",
+                computedHash = "",
+                message = "Agreement not found"
+            )
+        return verifyAgreement(agreement)
+    }
+
+    fun loadAgreements(
+        onComplete: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        if (AuthRepository.currentUser() == null) {
+            runOnMain { onError("You need to be signed in to view agreements") }
+            return
+        }
+
+        try {
+            startListening()
+            runOnMain { onComplete() }
+        } catch (e: Exception) {
+            Log.w("AgreementRepository", "Unable to load agreements", e)
+            runOnMain { onError(e.message ?: "Unable to load agreements") }
+        }
+    }
+
+    fun delete(
+        id: String,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        if (id.isBlank()) {
+            runOnMain { onError("Agreement not found") }
+            return
+        }
+
+        val current = _agreements.value.firstOrNull { it.id == id }
+        if (current == null) {
+            runOnMain { onError("Agreement not found") }
+            return
+        }
+
+        if (current.locked || current.fullySigned || current.status == AgreementStatus.SIGNED) {
+            runOnMain { onError("Signed agreements cannot be deleted") }
+            return
+        }
+
+        // Local state is only modified after Firestore confirms the deletion.
+        try {
+            db.collection(COLLECTION)
+                .document(id)
+                .delete()
+                .addOnSuccessListener {
+                    runOnMain {
+                        _agreements.value = _agreements.value.filterNot { agreement -> agreement.id == id }
+                        onSuccess()
+                    }
+                }
+                .addOnFailureListener {
+                    runOnMain { onError(it.message ?: "Unable to delete agreement") }
+                }
+        } catch (e: Exception) {
+            Log.w("AgreementRepository", "Unable to delete agreement", e)
+            runOnMain { onError("Unable to delete agreement") }
+        }
+    }
+
+    fun archive(
+        id: String,
+        onSuccess: (DealAgreement) -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        val current = if (id.isBlank()) {
+            null
+        } else {
+            _agreements.value.firstOrNull { it.id == id }
+        }
+        if (current == null) {
+            runOnMain { onError("Agreement not found") }
+            return
+        }
+
+        val updated = current.copy(
+            status = AgreementStatus.ARCHIVED,
+            updatedBy = AuthRepository.currentUser()?.uid.orEmpty()
+        )
+
+        // Fix: whitelisted update() only (status, updatedBy) per firestore.rules — never full set().
+        // Do not change local state until Firestore confirms the change.
+        try {
+            db.collection(COLLECTION)
+                .document(id)
+                .update(mapOf("status" to updated.status, "updatedBy" to updated.updatedBy))
+                .addOnSuccessListener {
+                    runOnMain {
+                        updateLocal(updated)
+                        onSuccess(updated)
+                    }
+                }
+                .addOnFailureListener {
+                    runOnMain { onError(it.message ?: "Unable to archive agreement") }
+                }
+        } catch (e: Exception) {
+            Log.w("AgreementRepository", "Unable to archive agreement", e)
+            runOnMain { onError("Unable to archive agreement") }
+        }
+    }
+
+    fun restore(
+        id: String,
+        onSuccess: (DealAgreement) -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        val current = if (id.isBlank()) {
+            null
+        } else {
+            _agreements.value.firstOrNull { it.id == id }
+        }
+        if (current == null) {
+            runOnMain { onError("Agreement not found") }
+            return
+        }
+        if (current.status != AgreementStatus.ARCHIVED) {
+            runOnMain { onError("Only archived agreements can be restored") }
+            return
+        }
+        val updated = current.copy(
+            status = AgreementStatus.PENDING,
+            updatedBy = AuthRepository.currentUser()?.uid.orEmpty()
+        )
+
+        // Fix: whitelisted update() only (status, updatedBy) per firestore.rules — never full set().
+        // Do not change local state until Firestore confirms the change.
+        try {
+            db.collection(COLLECTION)
+                .document(id)
+                .update(mapOf("status" to updated.status, "updatedBy" to updated.updatedBy))
+                .addOnSuccessListener {
+                    runOnMain {
+                        updateLocal(updated)
+                        onSuccess(updated)
+                    }
+                }
+                .addOnFailureListener {
+                    runOnMain { onError(it.message ?: "Unable to restore agreement") }
+                }
+        } catch (e: Exception) {
+            Log.w("AgreementRepository", "Unable to restore agreement", e)
+            runOnMain { onError("Unable to restore agreement") }
+        }
+    }
+
+    fun getAgreement(dealId: String): DealAgreement? {
+        return _agreements.value.find { it.dealId == dealId }
+    }
+
+    fun getAgreementById(id: String): DealAgreement? {
+        return _agreements.value.find { it.id == id }
+    }
+}

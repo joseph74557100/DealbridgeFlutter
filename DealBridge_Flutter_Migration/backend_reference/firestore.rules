@@ -1,0 +1,1264 @@
+rules_version = '2';
+
+service cloud.firestore {
+
+  match /databases/{database}/documents {
+
+    // ================================================================
+    // COMMON HELPERS
+    // ================================================================
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() &&
+        (
+          request.auth.token.get('admin', false) == true ||
+          request.auth.token.get('superAdmin', false) == true ||
+          (
+            exists(/databases/$(database)/documents/adminConfig/admins) &&
+            request.auth.uid in
+              get(/databases/$(database)/documents/adminConfig/admins)
+              .data.get('adminUids', [])
+          ) ||
+          (
+            exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+            get(/databases/$(database)/documents/admins/$(request.auth.uid))
+              .data.get('active', false) == true
+          )
+        );
+    }
+
+    function hasAdminPermission(permission) {
+      return signedIn() &&
+        (
+          request.auth.token.get('admin', false) == true ||
+          request.auth.token.get('superAdmin', false) == true ||
+          (
+            exists(/databases/$(database)/documents/adminConfig/admins) &&
+            request.auth.uid in
+              get(/databases/$(database)/documents/adminConfig/admins)
+              .data.get('adminUids', [])
+          ) ||
+          (
+            exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+            get(/databases/$(database)/documents/admins/$(request.auth.uid))
+              .data.get('active', false) == true &&
+            permission in
+              get(/databases/$(database)/documents/admins/$(request.auth.uid))
+              .data.get('permissions', [])
+          )
+        );
+    }
+
+    function businessExists(businessId) {
+      return businessId != null &&
+        businessId != '' &&
+        exists(/databases/$(database)/documents/businesses/$(businessId));
+    }
+
+    function businessOwnerId(businessId) {
+      return businessExists(businessId)
+        ? get(/databases/$(database)/documents/businesses/$(businessId))
+            .data.get('ownerId', '')
+        : '';
+    }
+
+    function ownsBusiness(businessId) {
+      return signedIn() &&
+        businessExists(businessId) &&
+        businessOwnerId(businessId) == request.auth.uid;
+    }
+
+    function ownsAnyBusiness(ids) {
+      return signedIn() &&
+        ids != null &&
+        ids.size() > 0 &&
+        (
+          ownsBusiness(ids[0]) ||
+          (ids.size() > 1 && ownsBusiness(ids[1])) ||
+          (ids.size() > 2 && ownsBusiness(ids[2])) ||
+          (ids.size() > 3 && ownsBusiness(ids[3]))
+        );
+    }
+
+    function userBlockedBy(targetUid) {
+      return signedIn() &&
+        targetUid != null &&
+        targetUid != '' &&
+        exists(/databases/$(database)/documents/users/$(targetUid)) &&
+        request.auth.uid in
+          get(/databases/$(database)/documents/users/$(targetUid))
+          .data.get('blockedUsers', []);
+    }
+
+    function postAuthor(postId) {
+      return exists(/databases/$(database)/documents/newsfeed/$(postId))
+        ? get(/databases/$(database)/documents/newsfeed/$(postId))
+            .data.get('userId', '')
+        : '';
+    }
+
+    function blockedByPostAuthor(postId) {
+      return postAuthor(postId) != '' &&
+        userBlockedBy(postAuthor(postId));
+    }
+
+    function validBusinessChatParticipant(threadId, uid) {
+      return exists(
+        /databases/$(database)/documents/businessChats/$(threadId)
+      ) &&
+      uid in
+        get(/databases/$(database)/documents/businessChats/$(threadId))
+        .data.get('participantIds', []);
+    }
+
+    function validPersonalParticipant(threadId, uid) {
+      return exists(
+        /databases/$(database)/documents/personalChats/$(threadId)
+      ) &&
+      uid in
+        get(/databases/$(database)/documents/personalChats/$(threadId))
+        .data.get('participantIds', []);
+    }
+
+    function validRatingCreate(businessId, ratingId) {
+      return signedIn() &&
+        request.resource.data.get('raterId', '') == request.auth.uid &&
+        request.resource.data.get('stars', 0) >= 1 &&
+        request.resource.data.get('stars', 0) <= 5 &&
+        request.resource.data.get('dealId', '') != '' &&
+        ratingId ==
+          request.auth.uid + '_' +
+          request.resource.data.get('dealId', '') &&
+        exists(
+          /databases/$(database)/documents/deals/$(request.resource.data.dealId)
+        ) &&
+        get(
+          /databases/$(database)/documents/deals/$(request.resource.data.dealId)
+        ).data.get('status', '') == 'COMPLETED' &&
+        get(
+          /databases/$(database)/documents/deals/$(request.resource.data.dealId)
+        ).data.get('businessId', '') == businessId &&
+        request.auth.uid in
+          get(
+            /databases/$(database)/documents/deals/$(request.resource.data.dealId)
+          ).data.get('participantIds', []) &&
+        businessExists(businessId) &&
+        businessOwnerId(businessId) != request.auth.uid;
+    }
+
+    function validDealParticipants(data) {
+      return data.get('participantIds', []).size() == 2 &&
+        data.participantIds[0] == data.senderId &&
+        data.participantIds[1] == businessOwnerId(data.businessId);
+    }
+
+    function validDealCreation() {
+      return signedIn() &&
+        request.resource.data.get('id', '') == request.resource.id &&
+        request.resource.data.get('senderId', '') == request.auth.uid &&
+        request.resource.data.get('businessId', '') != '' &&
+        request.resource.data.businessId != request.auth.uid &&
+        request.resource.data.businessId != request.resource.data.senderId &&
+        businessExists(request.resource.data.businessId) &&
+        businessOwnerId(request.resource.data.businessId) != request.auth.uid &&
+        validDealParticipants(request.resource.data) &&
+        request.resource.data.get('status', '') == 'PENDING' &&
+        request.resource.data.get(
+          'senderConfirmationStatus',
+          'REVIEW_TERMS'
+        ) == 'REVIEW_TERMS' &&
+        request.resource.data.get(
+          'recipientConfirmationStatus',
+          'REVIEW_TERMS'
+        ) == 'REVIEW_TERMS' &&
+        request.resource.data.get('currentStep', 1) == 1 &&
+        !request.resource.data.keys().hasAny([
+          'flagged',
+          'flagReasons',
+          'flaggedAt',
+          'completedAt',
+          'completedDate',
+          'acceptedAt',
+          'disputeStatus',
+          'disputeId'
+        ]);
+    }
+
+    function confirmationChangeAllowed(oldValue, newValue, mine) {
+      return oldValue == newValue ||
+        (
+          mine &&
+          (
+            (oldValue == 'REVIEW_TERMS' && newValue == 'AGREED') ||
+            (oldValue == 'AGREED' && newValue == 'CONFIRMED') ||
+            (oldValue == 'REVIEW_TERMS' && newValue == 'CONFIRMED')
+          )
+        );
+    }
+
+    function dealSender() {
+      return request.auth.uid == resource.data.get('senderId', '');
+    }
+
+    function dealRecipient() {
+      return request.auth.uid ==
+        resource.data.get('participantIds', ['',''])[1];
+    }
+
+    function agreementValidDeal(data) {
+      return data.get('dealId', '') != '' &&
+        exists(
+          /databases/$(database)/documents/deals/$(data.dealId)
+        ) &&
+        get(
+          /databases/$(database)/documents/deals/$(data.dealId)
+        ).data.get('status', '') in
+          ['PENDING', 'ACCEPTED', 'ACTIVE'] &&
+        get(
+          /databases/$(database)/documents/deals/$(data.dealId)
+        ).data.get('businessId', '') == data.get('businessOneId', '') &&
+        request.auth.uid in
+          get(
+            /databases/$(database)/documents/deals/$(data.dealId)
+          ).data.get('participantIds', []);
+    }
+
+
+    // ================================================================
+    // USERS
+    // ================================================================
+
+    match /users/{userId} {
+
+       allow get: if signedIn() &&
+        (
+          request.auth.uid == userId ||
+          isAdmin()
+        ) &&
+        !userBlockedBy(userId);
+
+      allow list: if signedIn() && request.query.limit <= 20;
+
+      allow create: if signedIn() &&
+        request.auth.uid == userId &&
+        request.resource.data.get('id', userId) == userId &&
+        request.resource.data.get('uid', userId) == userId &&
+        !request.resource.data.keys().hasAny([
+          'role',
+          'isAdmin',
+          'isSeniorPastor',
+          'ownerId',
+          'flagged',
+          'flagReasons',
+          'flaggedAt',
+          'sessionVersion',
+          'securityQuestion',
+          'securityAnswerHash'
+        ]);
+
+      allow update: if signedIn() &&
+        request.auth.uid == userId &&
+        !userBlockedBy(userId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'fullName',
+            'email',
+            'phone',
+            'company',
+            'city',
+            'bio',
+            'profileImage',
+            'profileImagePublicId',
+            'coverImage',
+            'coverImagePublicId',
+            'blockedUsers',
+            'isOnline',
+            'status',
+            'lastSeen',
+            'onesignalId',
+            'notificationSettings',
+            'twoFactorEnabled'
+          ]);
+
+      allow update: if signedIn() &&
+        hasAdminPermission('users') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'flagged',
+            'flagReasons',
+            'flaggedAt',
+            'status',
+            'blockedUsers'
+          ]);
+
+      allow delete: if false;
+
+      match /profile/{documentId} {
+        allow read: if signedIn() && !userBlockedBy(userId);
+
+        allow update: if signedIn() &&
+          request.auth.uid == userId;
+
+        allow create, delete: if false;
+      }
+
+      match /savedBusinesses/{businessId} {
+        allow read, update, delete: if signedIn() &&
+          request.auth.uid == userId;
+
+        allow create: if signedIn() &&
+          request.auth.uid == userId;
+      }
+
+      match /savedPosts/{postId} {
+        allow read, update, delete: if signedIn() &&
+          request.auth.uid == userId;
+
+        allow create: if signedIn() &&
+          request.auth.uid == userId;
+      }
+
+      match /hiddenDeals/{dealId} {
+        allow read, create, update, delete: if signedIn() &&
+          request.auth.uid == userId;
+      }
+
+      match /followedUsers/{followedUserId} {
+        allow read, update, delete: if signedIn() &&
+          request.auth.uid == userId;
+
+        allow create: if signedIn() &&
+          request.auth.uid == userId &&
+          followedUserId != userId;
+      }
+
+      match /sessions/{sessionId} {
+        allow read: if signedIn() &&
+          request.auth.uid == userId;
+
+        allow create: if signedIn() &&
+          request.auth.uid == userId;
+
+        allow update: if signedIn() &&
+          request.auth.uid == userId &&
+          request.resource.data.diff(resource.data)
+            .affectedKeys()
+            .hasOnly(['lastActive']);
+
+        allow delete: if signedIn() &&
+          request.auth.uid == userId;
+      }
+
+      match /securityLog/{eventId} {
+        allow read: if signedIn() &&
+          request.auth.uid == userId;
+
+        allow create, update, delete: if false;
+      }
+
+      match /{document=**} {
+        allow read, write: if false;
+      }
+    }
+
+
+    // ================================================================
+    // BUSINESSES
+    // ================================================================
+
+    match /businesses/{businessId} {
+
+      allow read: if signedIn();
+
+      allow create: if signedIn() &&
+        request.resource.data.get('id', businessId) == businessId &&
+        request.resource.data.get('ownerId', '') == request.auth.uid &&
+        request.resource.data.get('trustScore', 50) == 50 &&
+        request.resource.data.get('verificationLevel', 0) == 0 &&
+        request.resource.data.get('verified', false) == false &&
+        request.resource.data.get('completedDeals', 0) == 0 &&
+        request.resource.data.get('disputeCount', 0) == 0 &&
+        request.resource.data.get('reportCount', 0) == 0 &&
+        request.resource.data.get('rating', 0) == 0 &&
+        request.resource.data.get('ratingCount', 0) == 0 &&
+        request.resource.data.get('promoted', false) == false &&
+        request.resource.data.get('followersCount', 0) == 0;
+
+      allow update: if signedIn() &&
+        resource.data.get('ownerId', '') == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'name',
+            'category',
+            'city',
+            'description',
+            'phone',
+            'email',
+            'website',
+            'logoUrl',
+            'logoPublicId',
+            'gallery',
+            'galleryPublicIds'
+          ]);
+
+      allow update: if signedIn() &&
+        hasAdminPermission('manage_businesses') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'flagged',
+            'flagReasons',
+            'flaggedAt',
+            'businessStatus',
+            'verificationStatus'
+          ]);
+
+      allow delete: if signedIn() &&
+        resource.data.get('ownerId', '') == request.auth.uid;
+    }
+
+
+    // ================================================================
+    // BUSINESS RATINGS
+    // ================================================================
+
+    match /businesses/{businessId}/ratings/{ratingId} {
+
+      allow read: if signedIn();
+
+      allow create: if validRatingCreate(
+        businessId,
+        ratingId
+      );
+
+      allow update: if false;
+
+      allow delete: if signedIn() &&
+        resource.data.get('raterId', '') == request.auth.uid;
+    }
+
+
+    // ================================================================
+    // NEWSFEED
+    // ================================================================
+
+    match /newsfeed/{postId} {
+
+      allow read: if signedIn();
+
+      allow create: if signedIn() &&
+        request.resource.data.get('userId', '') == request.auth.uid &&
+        request.resource.data.get('type', '') != 'PRODUCT_ANNOUNCEMENT' &&
+        request.resource.data.get('verified', false) == false &&
+        request.resource.data.get('trending', false) == false &&
+        request.resource.data.get('isNewBusiness', false) == false &&
+        request.resource.data.get('viewCount', 0) == 0 &&
+        request.resource.data.get('likeCount', 0) == 0 &&
+        request.resource.data.get('commentCount', 0) == 0 &&
+        request.resource.data.get('followersCount', 0) == 0;
+
+      allow update: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid &&
+        request.resource.data.get('userId', '') ==
+          resource.data.get('userId', '') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'title',
+            'message',
+            'imageUrls',
+            'imagePublicIds',
+            'videoUrl',
+            'videoPublicId',
+            'category',
+            'city',
+            'address',
+            'hashTags'
+          ]);
+
+      allow update: if signedIn() &&
+        !blockedByPostAuthor(postId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['commentCount']) &&
+        request.resource.data.get('commentCount', 0) >= 0 &&
+        (
+          request.resource.data.commentCount ==
+            resource.data.get('commentCount', 0) + 1 ||
+          request.resource.data.commentCount ==
+            resource.data.get('commentCount', 0) - 1
+        );
+
+      allow delete: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid;
+
+      match /comments/{commentId} {
+
+        allow read: if signedIn();
+
+        allow create: if signedIn() &&
+          request.resource.data.get('userId', '') == request.auth.uid &&
+          !blockedByPostAuthor(postId);
+
+        allow update: if false;
+
+        allow delete: if signedIn() &&
+          resource.data.get('userId', '') == request.auth.uid;
+      }
+
+      match /likes/{uid} {
+
+        allow read: if signedIn();
+
+        allow create: if signedIn() &&
+          uid == request.auth.uid &&
+          !blockedByPostAuthor(postId);
+
+        allow update: if false;
+
+        allow delete: if signedIn() &&
+          uid == request.auth.uid;
+      }
+    }
+
+
+    // ================================================================
+    // STORIES
+    // ================================================================
+
+    match /stories/{storyId} {
+
+      allow read: if signedIn();
+
+      allow create: if signedIn() &&
+        request.resource.data.get('userId', '') == request.auth.uid;
+
+      allow update, delete: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid;
+    }
+
+
+    // ================================================================
+    // PROMOTIONS
+    // ================================================================
+
+    match /promotions/{promotionId} {
+
+      allow read: if signedIn();
+
+      allow create: if signedIn() &&
+        request.resource.data.get('creatorId', '') == request.auth.uid &&
+        ownsBusiness(request.resource.data.get('businessId', ''));
+
+      allow update: if signedIn() &&
+        resource.data.get('creatorId', '') == request.auth.uid &&
+        request.resource.data.get('creatorId', '') == request.auth.uid &&
+        request.resource.data.get('businessId', '') ==
+          resource.data.get('businessId', '');
+
+      allow delete: if signedIn() &&
+        resource.data.get('creatorId', '') == request.auth.uid;
+    }
+
+
+    // ================================================================
+    // DEALS
+    // ================================================================
+
+    match /deals/{dealId} {
+
+      allow get: if signedIn() &&
+        (
+          request.auth.uid in resource.data.get('participantIds', []) ||
+          isAdmin()
+        );
+
+      allow list: if signedIn();
+
+      allow create: if validDealCreation();
+
+      allow update: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []) &&
+        resource.data.get('status', '') != 'COMPLETED' &&
+        resource.data.get('status', '') != 'CANCELLED' &&
+        resource.data.get('status', '') != 'EXPIRED' &&
+        resource.data.get('flagged', false) != true &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'status',
+            'lastActivityAt',
+            'currentStep',
+            'senderConfirmationStatus',
+            'recipientConfirmationStatus',
+            'senderAgreedAt',
+            'recipientAgreedAt',
+            'senderConfirmedAt',
+            'recipientConfirmedAt'
+          ]) &&
+        (
+          request.resource.data.get('status', '') in
+            ['PENDING', 'ACCEPTED', 'DECLINED'] ||
+          (
+            request.resource.data.get('status', '') == 'CANCELLED' &&
+            resource.data.get('status', '') == 'PENDING' &&
+            request.auth.uid == resource.data.get('senderId', '')
+          )
+        ) &&
+        (
+          request.resource.data.status == resource.data.status ||
+          (
+            request.resource.data.status == 'ACCEPTED' &&
+            resource.data.status == 'PENDING' &&
+            request.auth.uid != resource.data.senderId
+          ) ||
+          (
+            request.resource.data.status == 'DECLINED' &&
+            resource.data.status == 'PENDING' &&
+            request.auth.uid != resource.data.senderId
+          ) ||
+          (
+            request.resource.data.status == 'CANCELLED' &&
+            resource.data.status == 'PENDING' &&
+            request.auth.uid == resource.data.senderId
+          )
+        ) &&
+        confirmationChangeAllowed(
+          resource.data.get(
+            'senderConfirmationStatus',
+            'REVIEW_TERMS'
+          ),
+          request.resource.data.get(
+            'senderConfirmationStatus',
+            'REVIEW_TERMS'
+          ),
+          dealSender()
+        ) &&
+        confirmationChangeAllowed(
+          resource.data.get(
+            'recipientConfirmationStatus',
+            'REVIEW_TERMS'
+          ),
+          request.resource.data.get(
+            'recipientConfirmationStatus',
+            'REVIEW_TERMS'
+          ),
+          dealRecipient()
+        ) &&
+        (
+          request.resource.data.get('senderAgreedAt', null) ==
+            resource.data.get('senderAgreedAt', null) ||
+          request.auth.uid == resource.data.get('senderId', '')
+        );
+
+      allow update: if signedIn() &&
+        hasAdminPermission('deals') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'flagged',
+            'flagReasons',
+            'flaggedAt'
+          ]);
+
+      allow delete: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []) &&
+        resource.data.get('status', '') != 'COMPLETED' &&
+        resource.data.get('status', '') != 'CANCELLED' &&
+        resource.data.get('fullySigned', false) != true &&
+        resource.data.get('locked', false) != true &&
+        resource.data.get('flagged', false) != true;
+    }
+
+
+    // ================================================================
+    // REVENUE
+    // ================================================================
+
+    match /revenue/{entryId} {
+
+      allow get: if signedIn() &&
+        resource.data.get('ownerId', '') == request.auth.uid;
+
+      allow list: if signedIn();
+
+      allow create: if signedIn() &&
+        request.resource.data.get('ownerId', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        resource.data.get('ownerId', '') == request.auth.uid &&
+        !request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasAny(['amount', 'ownerId']);
+
+      allow delete: if signedIn() &&
+        resource.data.get('ownerId', '') == request.auth.uid;
+    }
+
+
+    // ================================================================
+    // NOTIFICATIONS
+    // ================================================================
+
+    match /notifications/{notificationId} {
+
+      allow read: if signedIn() &&
+        resource.data.get('recipientId', '') == request.auth.uid;
+
+      allow create: if signedIn() &&
+        request.resource.data.get('recipientId', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        resource.data.get('recipientId', '') == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['isRead']);
+
+      allow delete: if signedIn() &&
+        resource.data.get('recipientId', '') == request.auth.uid;
+    }
+
+
+    // ================================================================
+    // CONVERSATIONS
+    // ================================================================
+
+    match /conversations/{conversationId} {
+
+      allow read: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid;
+
+      allow create: if signedIn() &&
+        request.resource.data.get('userId', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid &&
+        !request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasAny(['userId']);
+
+      allow delete: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid;
+    }
+
+
+    // ================================================================
+    // BUSINESS CHATS
+    // ================================================================
+
+    match /businessChats/{threadId} {
+
+      allow get: if signedIn() &&
+        ownsAnyBusiness(resource.data.get('participantIds', []));
+
+      allow list: if signedIn();
+
+      allow create: if signedIn() &&
+        request.resource.data.get('participantIds', []).size() == 2 &&
+        ownsAnyBusiness(request.resource.data.participantIds);
+
+      allow update: if signedIn() &&
+        ownsAnyBusiness(resource.data.get('participantIds', [])) &&
+        !request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasAny(['participantIds']);
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+
+        allow read: if signedIn() &&
+          validBusinessChatParticipant(threadId, request.auth.uid);
+
+        allow create: if signedIn() &&
+          validBusinessChatParticipant(threadId, request.auth.uid) &&
+          request.resource.data.get('senderId', '') == request.auth.uid;
+
+        allow update: if signedIn() &&
+          validBusinessChatParticipant(threadId, request.auth.uid) &&
+          resource.data.get('senderId', '') == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly([
+              'text',
+              'status',
+              'read',
+              'readBy',
+              'deliveredTo',
+              'deleted',
+              'reactions'
+            ]);
+
+        allow delete: if signedIn() &&
+          resource.data.get('senderId', '') == request.auth.uid;
+      }
+
+      match /presence/{presenceId} {
+
+        allow read: if signedIn() &&
+          validBusinessChatParticipant(threadId, request.auth.uid);
+
+        allow create, update: if signedIn() &&
+          validBusinessChatParticipant(threadId, request.auth.uid) &&
+          request.resource.data.get('participantId', '') ==
+            request.auth.uid;
+
+        allow delete: if false;
+      }
+    }
+
+
+    // ================================================================
+    // PERSONAL CHATS
+    // ================================================================
+
+    match /personalChats/{threadId} {
+
+      allow get: if signedIn() &&
+        validPersonalParticipant(threadId, request.auth.uid);
+
+      allow list: if signedIn() &&
+        request.query.limit <= 100;
+
+      allow create: if signedIn() &&
+        request.resource.data.get('participantIds', []).size() == 2 &&
+        request.auth.uid in request.resource.data.participantIds &&
+        request.resource.data.participantIds[0] !=
+          request.resource.data.participantIds[1];
+
+      allow update: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []) &&
+        !request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasAny(['participantIds']);
+
+      allow delete: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []);
+
+      match /messages/{messageId} {
+
+        allow get: if signedIn() &&
+          validPersonalParticipant(threadId, request.auth.uid);
+
+        allow list: if signedIn() &&
+          validPersonalParticipant(threadId, request.auth.uid);
+
+        allow create: if signedIn() &&
+          validPersonalParticipant(threadId, request.auth.uid) &&
+          request.resource.data.get('senderId', '') == request.auth.uid;
+
+        allow update: if signedIn() &&
+          validPersonalParticipant(threadId, request.auth.uid) &&
+          resource.data.get('senderId', '') == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly([
+              'text',
+              'status',
+              'read',
+              'readBy',
+              'deliveredTo',
+              'deleted',
+              'reactions'
+            ]);
+
+        allow delete: if signedIn() &&
+          request.auth.uid in resource.data.get('participantIds', []);
+      }
+
+      match /presence/{presenceId} {
+
+        allow read: if signedIn() &&
+          validPersonalParticipant(threadId, request.auth.uid);
+
+        allow create, update: if signedIn() &&
+          validPersonalParticipant(threadId, request.auth.uid) &&
+          request.resource.data.get('participantId', '') ==
+            request.auth.uid;
+
+        allow delete: if signedIn() &&
+          validPersonalParticipant(threadId, request.auth.uid);
+      }
+    }
+
+
+    // ================================================================
+    // AGREEMENTS
+    // ================================================================
+
+    match /agreements/{agreementId} {
+
+      allow get: if signedIn() &&
+        (
+          request.auth.uid in resource.data.get('participantIds', []) ||
+          ownsAnyBusiness(resource.data.get('participantIds', []))
+        );
+
+      allow list: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []);
+
+      allow create: if signedIn() &&
+        request.resource.data.get('agreementId', '') == agreementId &&
+        request.resource.data.get('createdBy', '') == request.auth.uid &&
+        request.auth.uid in request.resource.data.get('participantIds', []) &&
+        request.resource.data.get('businessOneId', '') !=
+          request.resource.data.get('businessTwoId', '') &&
+        request.resource.data.get('requiredSignatures', 0) >= 2 &&
+        request.resource.data.get('requiredSignatures', 0) <= 4 &&
+        request.resource.data.get('signatures', []).size() == 0 &&
+        request.resource.data.get('signingStarted', false) == false &&
+        request.resource.data.get('fullySigned', false) == false &&
+        request.resource.data.get('locked', false) == false &&
+        request.resource.data.get('status', '') == 'Pending Signature' &&
+        agreementValidDeal(request.resource.data);
+
+      allow update: if signedIn() &&
+        (
+          request.auth.uid in resource.data.get('participantIds', []) ||
+          ownsAnyBusiness(resource.data.get('participantIds', []))
+        ) &&
+        resource.data.get('fullySigned', false) != true &&
+        resource.data.get('locked', false) != true &&
+        resource.data.get('status', '') != 'Signed' &&
+        request.resource.data.get('status', '') in
+          ['Pending Signature', 'Archived'] &&
+        request.resource.data.get('signatures', []) ==
+          resource.data.get('signatures', []) &&
+        request.resource.data.get('fullySigned', false) ==
+          resource.data.get('fullySigned', false) &&
+        request.resource.data.get('locked', false) ==
+          resource.data.get('locked', false) &&
+        request.resource.data.get('signingStarted', false) ==
+          resource.data.get('signingStarted', false) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'status',
+            'notes',
+            'attachments',
+            'pdfUrl',
+            'fileId',
+            'fileName',
+            'localPdfPath',
+            'expiryDate',
+            'updatedBy',
+            'driveStatus'
+          ]);
+
+      allow delete: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []) &&
+        resource.data.get('status', '') != 'Signed' &&
+        resource.data.get('fullySigned', false) != true &&
+        resource.data.get('locked', false) != true;
+    }
+
+
+    // ================================================================
+    // AGREEMENT VERSIONS
+    // ================================================================
+
+    match /agreements/{agreementId}/versions/{versionId} {
+
+      allow read: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []);
+
+      allow create, update, delete: if false;
+    }
+
+
+    // ================================================================
+    // AUDIT LOGS
+    // ================================================================
+
+    match /auditLogs/{auditId} {
+
+      allow read: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []);
+
+      allow create, update, delete: if false;
+    }
+
+
+    // ================================================================
+    // ADMIN REVIEW
+    // ================================================================
+
+    match /adminReviews/{reviewId} {
+
+      allow read: if signedIn() && isAdmin();
+
+      allow create, update, delete: if false;
+    }
+
+
+    // ================================================================
+    // ADMIN CONFIG
+    // ================================================================
+
+    match /adminConfig/admins {
+
+      allow read: if signedIn() && isAdmin();
+
+      allow create, update, delete: if false;
+    }
+
+    match /adminConfig/{document=**} {
+
+      allow read, write: if signedIn() &&
+        isAdmin() &&
+        document != 'admins';
+    }
+
+
+    // ================================================================
+    // ADMINS
+    // ================================================================
+
+    match /admins/{adminId} {
+
+      allow get: if signedIn() &&
+        (
+          request.auth.uid == adminId ||
+          isAdmin()
+        );
+
+      allow list: if signedIn() && isAdmin();
+
+      allow create, update, delete: if false;
+    }
+
+
+    // ================================================================
+    // SERVER-ONLY COLLECTIONS
+    // ================================================================
+
+    match /securityCounters/{id} {
+      allow read, write: if false;
+    }
+
+    match /deal_locks/{id} {
+      allow read, write: if false;
+    }
+
+    match /dealDisputes/{id} {
+      allow read: if signedIn() &&
+        request.auth.uid in resource.data.get('participantIds', []);
+
+      allow create, update, delete: if false;
+    }
+
+
+    // ================================================================
+    // VERIFICATION
+    // ================================================================
+
+    match /verificationRequests/{requestId} {
+
+      allow read: if signedIn() &&
+        (
+          resource.data.get('ownerId', '') == request.auth.uid ||
+          isAdmin()
+        );
+
+      allow create: if signedIn() &&
+        request.resource.data.get('ownerId', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        resource.data.get('ownerId', '') == request.auth.uid &&
+        !request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasAny(['ownerId']);
+
+      allow delete: if false;
+    }
+
+
+    // ================================================================
+    // SUPPORT
+    // ================================================================
+
+    match /supportRequests/{requestId} {
+
+      allow read: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid;
+
+      allow create: if signedIn() &&
+        request.resource.data.get('userId', '') == request.auth.uid;
+
+      allow update, delete: if false;
+    }
+
+
+    // ================================================================
+    // PROBLEM REPORTS
+    // ================================================================
+
+    match /problemReports/{reportId} {
+
+      allow read, update: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid;
+
+      allow create: if signedIn() &&
+        request.resource.data.get('userId', '') == request.auth.uid;
+
+      allow delete: if false;
+    }
+
+
+    // ================================================================
+    // BUSINESS REPORTS
+    // ================================================================
+
+    match /businessReports/{reportId} {
+
+      allow read: if signedIn() &&
+        (
+          resource.data.get('reportedBy', '') == request.auth.uid ||
+          isAdmin()
+        );
+
+      allow create: if signedIn() &&
+        request.resource.data.get('reportedBy', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        hasAdminPermission('reports') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'status',
+            'action',
+            'reviewedBy',
+            'reviewedAt',
+            'reason'
+          ]);
+
+      allow delete: if false;
+    }
+
+
+    // ================================================================
+    // FEATURE REQUESTS
+    // ================================================================
+
+    match /featureRequests/{requestId} {
+
+      allow read, update: if signedIn() &&
+        resource.data.get('userId', '') == request.auth.uid;
+
+      allow create: if signedIn() &&
+        request.resource.data.get('userId', '') == request.auth.uid;
+
+      allow delete: if false;
+    }
+
+
+    // ================================================================
+    // USER REPORTS
+    // ================================================================
+
+    match /userReports/{reportId} {
+
+      allow read: if signedIn() &&
+        (
+          resource.data.get('reportedBy', '') == request.auth.uid ||
+          isAdmin()
+        );
+
+      allow create: if signedIn() &&
+        request.resource.data.get('reportedBy', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        hasAdminPermission('reports') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'status',
+            'action',
+            'reviewedBy',
+            'reviewedAt',
+            'reason'
+          ]);
+
+      allow delete: if false;
+    }
+
+
+    // ================================================================
+    // POST REPORTS
+    // ================================================================
+
+    match /postReports/{reportId} {
+
+      allow read: if signedIn() &&
+        (
+          resource.data.get('reportedBy', '') == request.auth.uid ||
+          isAdmin()
+        );
+
+      allow create: if signedIn() &&
+        request.resource.data.get('reportedBy', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        hasAdminPermission('reports') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'status',
+            'action',
+            'reviewedBy',
+            'reviewedAt',
+            'reason'
+          ]);
+
+      allow delete: if false;
+    }
+
+
+    // ================================================================
+    // MESSAGE REPORTS
+    // ================================================================
+
+    match /messageReports/{reportId} {
+
+      allow read: if signedIn() &&
+        (
+          resource.data.get('reportedBy', '') == request.auth.uid ||
+          isAdmin()
+        );
+
+      allow create: if signedIn() &&
+        request.resource.data.get('reportedBy', '') == request.auth.uid;
+
+      allow update: if signedIn() &&
+        hasAdminPermission('reports') &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly([
+            'status',
+            'action',
+            'reviewedBy',
+            'reviewedAt',
+            'reason'
+          ]);
+
+      allow delete: if false;
+    }
+
+
+    // ================================================================
+    // LEGACY CHATS
+    // ================================================================
+
+    match /chats/{chatId} {
+      allow read, write: if false;
+
+      match /messages/{messageId} {
+        allow read, write: if false;
+      }
+
+      match /presence/{presenceId} {
+        allow read, write: if false;
+      }
+    }
+
+
+    // ================================================================
+    // FINAL DEFAULT DENY
+    // ================================================================
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

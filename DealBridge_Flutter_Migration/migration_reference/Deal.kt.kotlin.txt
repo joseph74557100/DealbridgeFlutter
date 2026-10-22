@@ -1,0 +1,496 @@
+package com.example.dealbridge.data.model
+
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * Canonical DealBridge deal lifecycle.
+ *
+ * CLIENT-WRITABLE:
+ * - PENDING
+ * - ACCEPTED
+ * - DECLINED
+ *
+ * SERVER-AUTHORITATIVE:
+ * - ACTIVE
+ * - COMPLETED
+ * - CANCELLED
+ * - EXPIRED
+ *
+ * The Android client must never directly write the server-authoritative
+ * states above.
+ */
+object DealStatus {
+
+    const val PENDING = "PENDING"
+    const val ACCEPTED = "ACCEPTED"
+    const val ACTIVE = "ACTIVE"
+    const val COMPLETED = "COMPLETED"
+    const val DECLINED = "DECLINED"
+    const val CANCELLED = "CANCELLED"
+    const val EXPIRED = "EXPIRED"
+
+    /**
+     * Statuses that normal Android client operations may write.
+     */
+    val clientWritable = listOf(
+        PENDING,
+        ACCEPTED,
+        DECLINED
+    )
+
+    /**
+     * Statuses displayed by Activity/Deals filtering.
+     */
+    val filterTabs = listOf(
+        "All",
+        PENDING,
+        ACCEPTED,
+        ACTIVE,
+        COMPLETED,
+        DECLINED,
+        EXPIRED
+    )
+}
+
+/**
+ * Two-party agreement confirmation lifecycle.
+ *
+ * REVIEW_TERMS
+ *      ↓
+ * AGREED
+ *      ↓
+ * CONFIRMED
+ *      ↓
+ * server detects both confirmed
+ *      ↓
+ * COMPLETED
+ *
+ * COMPLETED is represented by DealStatus and is not a confirmation status.
+ */
+object AgreementConfirmationStatus {
+
+    const val REVIEW_TERMS = "REVIEW_TERMS"
+
+    const val AGREED = "AGREED"
+
+    const val CONFIRMED = "CONFIRMED"
+}
+
+/**
+ * Canonical DealBridge deal model.
+ *
+ * IMPORTANT DATA MODEL RULE:
+ *
+ * participantIds contains USER UID values only.
+ *
+ * Example:
+ *
+ * participantIds = [
+ *     sender Firebase UID,
+ *     recipient business owner's Firebase UID
+ * ]
+ *
+ * businessId is the TARGET BUSINESS DOCUMENT ID and must NOT be placed
+ * inside participantIds.
+ */
+data class Deal(
+
+    // ---------------------------------------------------------------------
+    // IDENTITY
+    // ---------------------------------------------------------------------
+
+    val id: String = "",
+
+    /**
+     * Target business document ID.
+     *
+     * This is NOT a user UID.
+     */
+    val businessId: String = "",
+
+    /**
+     * Snapshot/display name of the target business.
+     */
+    val businessName: String = "",
+
+    // ---------------------------------------------------------------------
+    // DEAL CONTENT
+    // ---------------------------------------------------------------------
+
+    val title: String = "",
+
+    val description: String = "",
+
+    /**
+     * Kept as String because the existing DealBridge UI/model represents
+     * deal value as text.
+     */
+    val value: String = "",
+
+    // ---------------------------------------------------------------------
+    // SENDER
+    // ---------------------------------------------------------------------
+
+    /**
+     * Firebase Authentication UID of the user creating the deal.
+     */
+    val senderId: String = "",
+
+    /**
+     * Display name shown in the UI.
+     *
+     * This is presentation data, not an authorization field.
+     */
+    val senderName: String = "",
+
+    // ---------------------------------------------------------------------
+    // STATUS
+    // ---------------------------------------------------------------------
+
+    val status: String = DealStatus.PENDING,
+
+    // ---------------------------------------------------------------------
+    // CREATION TIME
+    // ---------------------------------------------------------------------
+
+    /**
+     * Human-readable creation date retained for compatibility with the
+     * existing DealBridge UI.
+     *
+     * Example:
+     * "18 Sep 2026"
+     *
+     * IMPORTANT:
+     * This is intentionally a String in the current data model.
+     *
+     * The machine-readable creation time is [timestamp].
+     */
+    val createdAt: String = "",
+
+    /**
+     * Machine-readable creation timestamp in epoch milliseconds.
+     *
+     * 0 means missing/legacy data.
+     *
+     * The repository supplies the real value when creating a new deal.
+     */
+    val timestamp: Long = 0L,
+
+    // ---------------------------------------------------------------------
+    // DEADLINE / EXPIRY
+    // ---------------------------------------------------------------------
+
+    /**
+     * Optional sender-selected deadline in epoch milliseconds.
+     *
+     * 0 = no explicit deadline.
+     */
+    val deadline: Long = 0L,
+
+    /**
+     * Server-validity deadline in epoch milliseconds.
+     *
+     * 0 = no expiry value available, normally only legacy data.
+     */
+    val expiresAt: Long = 0L,
+
+    // ---------------------------------------------------------------------
+    // SERVER-AUTHORITATIVE COMPLETION
+    // ---------------------------------------------------------------------
+
+    /**
+     * Set by trusted backend when the deal is completed.
+     *
+     * Android clients never write this field.
+     */
+    val completedAt: Long = 0L,
+
+    /**
+     * Set by trusted backend when the deal is accepted.
+     *
+     * Android clients never write this field.
+     */
+    val acceptedAt: Long = 0L,
+
+    /**
+     * Human-readable completion date generated by the backend.
+     */
+    val completedDate: String = "",
+
+    // ---------------------------------------------------------------------
+    // SERVER-AUTHORITATIVE REVIEW FLAGS
+    // ---------------------------------------------------------------------
+
+    /**
+     * Indicates that the backend/admin review system flagged the deal.
+     *
+     * Android clients never set or clear this field.
+     */
+    val flagged: Boolean = false,
+
+    /**
+     * Reasons supplied by the backend review system.
+     */
+    val flagReasons: List<String> = emptyList(),
+
+    /**
+     * Backend timestamp when the deal was flagged.
+     */
+    val flaggedAt: Long = 0L,
+
+    // ---------------------------------------------------------------------
+    // PARTICIPANTS
+    // ---------------------------------------------------------------------
+
+    /**
+     * USER Firebase UIDs only.
+     *
+     * A valid new deal must contain exactly two different users:
+     *
+     * [senderId, recipientBusinessOwnerUid]
+     */
+    val participantIds: List<String> = emptyList(),
+
+    // ---------------------------------------------------------------------
+    // DISPUTES
+    // ---------------------------------------------------------------------
+
+    /**
+     * Empty = no active dispute.
+     *
+     * Possible backend values:
+     * - Open
+     * - Resolved
+     * - Dismissed
+     */
+    val disputeStatus: String = "",
+
+    /**
+     * ID of the corresponding dealDisputes document.
+     */
+    val disputeId: String = "",
+
+    // ---------------------------------------------------------------------
+    // LEGACY QR DATA
+    // ---------------------------------------------------------------------
+
+    /**
+     * Deprecated.
+     *
+     * New DealBridge deals do not use QR finalization.
+     *
+     * These fields remain only so older Firestore documents can still
+     * be read safely.
+     */
+    val qrToken: String = "",
+
+    val qrGeneratedAt: Long = 0L,
+
+    val qrInvalidatedAt: Long = 0L,
+
+    val qrScannedAt: Long = 0L,
+
+    val qrScannedByBusinessId: String = "",
+
+    // ---------------------------------------------------------------------
+    // SENDER AGREEMENT
+    // ---------------------------------------------------------------------
+
+    /**
+     * Sender's current agreement state.
+     */
+    val senderConfirmationStatus: String =
+        AgreementConfirmationStatus.REVIEW_TERMS,
+
+    /**
+     * Timestamp when sender agreed to terms.
+     *
+     * Currently written by the authenticated client as part of the
+     * controlled confirmation flow and protected by Firestore rules.
+     */
+    val senderAgreedAt: Long = 0L,
+
+    /**
+     * Timestamp when sender confirmed the deal.
+     */
+    val senderConfirmedAt: Long = 0L,
+
+    // ---------------------------------------------------------------------
+    // RECIPIENT AGREEMENT
+    // ---------------------------------------------------------------------
+
+    /**
+     * Recipient's current agreement state.
+     */
+    val recipientConfirmationStatus: String =
+        AgreementConfirmationStatus.REVIEW_TERMS,
+
+    /**
+     * Timestamp when recipient agreed to terms.
+     */
+    val recipientAgreedAt: Long = 0L,
+
+    /**
+     * Timestamp when recipient confirmed the deal.
+     */
+    val recipientConfirmedAt: Long = 0L,
+
+    // ---------------------------------------------------------------------
+    // TERMS
+    // ---------------------------------------------------------------------
+
+    /**
+     * Terms displayed to both parties.
+     */
+    val terms: String = "",
+
+    // ---------------------------------------------------------------------
+    // ACTIVITY
+    // ---------------------------------------------------------------------
+
+    /**
+     * Epoch milliseconds of the most recent deal activity.
+     *
+     * Used to sort the Activity screen.
+     */
+    val lastActivityAt: Long = 0L,
+
+    /**
+     * UI progress:
+     *
+     * 1 = Review Terms
+     * 2 = Agreed / Accepted
+     * 3 = Confirmed
+     * 4 = Completed
+     */
+    val currentStep: Int = 1
+)
+
+/**
+ * Default deal validity period.
+ *
+ * 30 days.
+ */
+const val DEFAULT_DEAL_TTL_MS: Long =
+    30L * 24L * 60L * 60L * 1000L
+
+/**
+ * Returns the status that should be displayed to the current user.
+ *
+ * A sender viewing their own PENDING deal sees:
+ *
+ * "Awaiting Approval"
+ *
+ * rather than simply:
+ *
+ * "Pending"
+ */
+fun Deal.displayStatusFor(
+    currentUserId: String?
+): String {
+
+    if (
+        status == DealStatus.PENDING &&
+        senderId.isNotBlank() &&
+        senderId == currentUserId
+    ) {
+        return "Awaiting Approval"
+    }
+
+    return when (status) {
+
+        DealStatus.PENDING ->
+            "Pending"
+
+        DealStatus.ACCEPTED ->
+            "Accepted"
+
+        DealStatus.ACTIVE ->
+            "Active"
+
+        DealStatus.COMPLETED ->
+            "Completed"
+
+        DealStatus.DECLINED ->
+            "Declined"
+
+        DealStatus.CANCELLED ->
+            "Cancelled"
+
+        DealStatus.EXPIRED ->
+            "Expired"
+
+        "Flagged" ->
+            "Under Review"
+
+        else ->
+            status
+    }
+}
+
+/**
+ * Formats an epoch deadline for display.
+ *
+ * Returns null when no deadline exists.
+ */
+fun formatDeadline(
+    deadline: Long
+): String? {
+
+    if (deadline <= 0L) {
+        return null
+    }
+
+    return SimpleDateFormat(
+        "dd MMM yyyy",
+        Locale.getDefault()
+    ).format(
+        Date(deadline)
+    )
+}
+
+/**
+ * Formats an epoch timestamp for display.
+ *
+ * This keeps Firestore data numeric while allowing the UI to show
+ * a readable date.
+ */
+fun formatDealDate(
+    timestamp: Long
+): String? {
+
+    if (timestamp <= 0L) {
+        return null
+    }
+
+    return SimpleDateFormat(
+        "dd MMM yyyy",
+        Locale.getDefault()
+    ).format(
+        Date(timestamp)
+    )
+}
+
+/**
+ * Returns a compact human-readable representation of a deal timestamp.
+ *
+ * Example:
+ * "18 Sep 2026"
+ */
+fun formatDealDateTime(
+    timestamp: Long
+): String? {
+
+    if (timestamp <= 0L) {
+        return null
+    }
+
+    return SimpleDateFormat(
+        "dd MMM yyyy HH:mm",
+        Locale.getDefault()
+    ).format(
+        Date(timestamp)
+    )
+}

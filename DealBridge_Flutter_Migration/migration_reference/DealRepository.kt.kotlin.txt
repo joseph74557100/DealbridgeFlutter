@@ -1,0 +1,2517 @@
+package com.example.dealbridge.data
+
+import android.util.Log
+import androidx.compose.runtime.mutableStateListOf
+import com.example.dealbridge.data.model.AgreementConfirmationStatus
+import com.example.dealbridge.data.model.DEFAULT_DEAL_TTL_MS
+import com.example.dealbridge.data.model.Deal
+import com.example.dealbridge.data.model.DealStatus
+import com.example.dealbridge.firebase.AuthRepository
+import com.google.firebase.Timestamp
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.FieldValue
+
+/**
+ * Production DealRepository
+ *
+ * Deal lifecycle:
+ *
+ * PENDING
+ *    ↓ recipient accepts
+ * ACCEPTED
+ *    ↓ both parties agree/confirm
+ * server detects both CONFIRMED
+ *    ↓
+ * COMPLETED
+ *
+ * Server-authoritative states:
+ * - COMPLETED
+ * - CANCELLED
+ * - EXPIRED
+ *
+ * The Android client never writes those states directly.
+ *
+ * participantIds contains USER UIDs only.
+ *
+ * Example:
+ *
+ * participantIds = [
+ *     senderUserUid,
+ *     recipientBusinessOwnerUid
+ * ]
+ */
+object DealRepository {
+
+    private const val TAG = "DealFlow"
+
+    private const val COLLECTION = "deals"
+    private const val BUSINESSES_COLLECTION = "businesses"
+
+    private val db: FirebaseFirestore by lazy {
+        FirebaseFirestore.getInstance()
+    }
+
+    private val auth: FirebaseAuth by lazy {
+        FirebaseAuth.getInstance()
+    }
+
+    /**
+     * Observable list used by Deal/Activity UI.
+     */
+    val deals = mutableStateListOf<Deal>()
+
+    /**
+     * IDs of deals the current user has hidden from their list.
+     */
+    val hiddenDealIds = mutableStateListOf<String>()
+
+    private var dealsRegistration: ListenerRegistration? = null
+    private var hiddenDealsRegistration: ListenerRegistration? = null
+    private var authRegistration: FirebaseAuth.AuthStateListener? = null
+
+    private var listening = false
+    private var listeningUid: String? = null
+
+    // =====================================================================
+    // AUTH
+    // =====================================================================
+
+    private fun currentUid(): String {
+        return auth.currentUser?.uid.orEmpty()
+    }
+
+    private fun requireUid(
+        onFailure: ((String) -> Unit)? = null
+    ): String? {
+
+        val uid = currentUid()
+
+        if (uid.isBlank()) {
+            onFailure?.invoke("You must be signed in")
+            return null
+        }
+
+        return uid
+    }
+
+    // =====================================================================
+    // REAL-TIME LISTENING
+    // =====================================================================
+
+    /**
+     * Starts the authenticated user's deal listener.
+     *
+     * Firestore query:
+     *
+     * whereArrayContains("participantIds", authenticatedUid)
+     *
+     * Therefore participantIds MUST contain user UIDs.
+     */
+    fun startListening() {
+
+        installAuthListener()
+
+        val uid = currentUid()
+
+        if (uid.isBlank()) {
+
+            Log.d(
+                TAG,
+                "startListening: no authenticated Firebase user. " +
+                    "Listener not started; keeping existing cached deals."
+            )
+
+            stopDealListenerOnly()
+
+            return
+        }
+
+        if (
+            listening &&
+            listeningUid == uid &&
+            dealsRegistration != null
+        ) {
+
+            Log.d(
+                TAG,
+                "startListening: already listening uid=$uid"
+            )
+
+            return
+        }
+
+        stopDealListenerOnly()
+
+        listening = true
+        listeningUid = uid
+
+        startHiddenDealsListener(uid)
+
+        Log.d(
+            TAG,
+            "Starting deal listener uid=$uid"
+        )
+
+        dealsRegistration = db.collection(COLLECTION)
+            .whereArrayContains(
+                "participantIds",
+                uid
+            )
+            .addSnapshotListener { snapshot, error ->
+
+                /*
+                 * =========================================================
+                 * CRITICAL FIX
+                 * =========================================================
+                 *
+                 * NEVER clear the current deals list when Firestore
+                 * reports a listener error.
+                 *
+                 * Firestore can have valid locally cached data while the
+                 * server/network/rules request fails.
+                 *
+                 * Clearing the list here makes valid offline deals
+                 * disappear immediately when the network reconnects.
+                 */
+                if (error != null) {
+
+                    /*
+                     * NEVER clear cached deals on a listener error.
+                     *
+                     * Offline cache stays visible; the server result
+                     * only replaces UI state after a SUCCESSFUL
+                     * snapshot (see below).
+                     */
+                    Log.e(
+                        TAG,
+                        "Deal listener failed. Keeping existing cached deals. " +
+                            "code=${error.code}, message=${error.message}",
+                        error
+                    )
+
+                    when (error.code) {
+                        FirebaseFirestoreException.Code.PERMISSION_DENIED,
+                        FirebaseFirestoreException.Code.UNAUTHENTICATED -> {
+                            if (currentUid() != uid) {
+                                Log.w(
+                                    TAG,
+                                    "Auth changed while listening. " +
+                                        "Restarting deal listener."
+                                )
+                                startListening()
+                            }
+                        }
+
+                        else -> {
+                            Log.w(
+                                TAG,
+                                "Temporary Firestore/listener failure. " +
+                                    "Existing deals remain visible."
+                            )
+                        }
+                    }
+
+                    return@addSnapshotListener
+                }
+
+                /*
+                 * No error but no snapshot.
+                 */
+                if (snapshot == null) {
+
+                    Log.w(
+                        TAG,
+                        "Deal listener returned null snapshot. " +
+                            "Keeping existing deals."
+                    )
+
+                    return@addSnapshotListener
+                }
+
+                /*
+                 * Snapshot diagnostics: cache vs server, pending writes.
+                 */
+                Log.d(
+                    TAG,
+                    "Deal snapshot: uid=$uid, " +
+                        "documents=${snapshot.documents.size}, " +
+                        "fromCache=${snapshot.metadata.isFromCache}, " +
+                        "pendingWrites=${snapshot.metadata.hasPendingWrites()}"
+                )
+
+                /*
+                 * Per-document diagnostics (no credentials/tokens).
+                 */
+                snapshot.documents.forEach { document ->
+                    val participantIds =
+                        document.get("participantIds") as? List<*>
+
+                    Log.d(
+                        TAG,
+                        "Deal document: " +
+                            "id=${document.id}, " +
+                            "participantIds=$participantIds, " +
+                            "containsCurrentUid=" +
+                            "${participantIds?.contains(uid)}, " +
+                            "senderId=${document.getString("senderId")}, " +
+                            "businessId=" +
+                            "${document.getString("businessId")}, " +
+                            "status=${document.getString("status")}"
+                    )
+                }
+
+                /*
+                 * Parse each document independently.
+                 *
+                 * A single malformed deal must NOT cause the entire
+                 * listener result to disappear.
+                 */
+                val parsedDeals =
+                    snapshot.documents.mapNotNull { document ->
+
+                        try {
+
+                            val parsed =
+                                parseDeal(document)
+
+                            if (parsed == null) {
+
+                                Log.e(
+                                    TAG,
+                                    "Deal parser returned NULL " +
+                                        "for id=${document.id}"
+                                )
+
+                            } else {
+
+                                Log.d(
+                                    TAG,
+                                    "Deal parsed successfully " +
+                                        "id=${document.id}"
+                                )
+                            }
+
+                            parsed
+
+                        } catch (error: Exception) {
+
+                            Log.e(
+                                TAG,
+                                "Deal parsing exception " +
+                                    "id=${document.id}",
+                                error
+                            )
+
+                            null
+                        }
+                    }
+
+                /*
+                 * Reconcile deals for UI display only.
+                 *
+                 * This does NOT write EXPIRED back to Firestore.
+                 */
+                val loaded =
+                    parsedDeals
+                        .distinctBy { deal ->
+                            deal.id
+                        }
+                        .map { deal ->
+                            reconcileDisplayExpiry(deal)
+                        }
+                        .filter { deal ->
+
+                            /*
+                             * Cancelled deals remain stored in Firestore
+                             * for records but are hidden from the active
+                             * Activity list.
+                             */
+                            deal.status != DealStatus.CANCELLED &&
+                                hiddenDealIds.none { hiddenId ->
+                                    hiddenId == deal.id
+                                }
+                        }
+                        .sortedByDescending { deal ->
+
+                            if (deal.lastActivityAt > 0L) {
+                                deal.lastActivityAt
+                            } else {
+                                deal.timestamp
+                            }
+                        }
+
+                /*
+                 * Detailed reconciliation information.
+                 */
+                Log.d(
+                    TAG,
+                    "Deal reconciliation: " +
+                        "firestoreDocuments=${snapshot.documents.size}, " +
+                        "parsedDeals=${parsedDeals.size}, " +
+                        "displayedDeals=${loaded.size}, " +
+                        "fromCache=${snapshot.metadata.isFromCache}"
+                )
+
+                /*
+                 * At this point the snapshot itself succeeded.
+                 *
+                 * Therefore replacing the UI list is safe.
+                 *
+                 * IMPORTANT:
+                 *
+                 * We only clear the list AFTER a successful snapshot.
+                 */
+                deals.clear()
+                deals.addAll(loaded)
+
+                loaded.forEach { deal ->
+
+                    Log.d(
+                        TAG,
+                        "VISIBLE DEAL " +
+                            "id=${deal.id} " +
+                            "status=${deal.status} " +
+                            "sender=${deal.senderId} " +
+                            "business=${deal.businessId} " +
+                            "participants=${deal.participantIds} " +
+                            "senderConfirmation=" +
+                            "${deal.senderConfirmationStatus} " +
+                            "recipientConfirmation=" +
+                            "${deal.recipientConfirmationStatus}"
+                    )
+                }
+            }
+    }
+
+    /**
+     * Firebase Authentication lifecycle listener.
+     */
+    private fun installAuthListener() {
+
+        if (authRegistration != null) {
+            return
+        }
+
+        val listener =
+            FirebaseAuth.AuthStateListener { firebaseAuth ->
+
+                val uid =
+                    firebaseAuth.currentUser?.uid
+
+                Log.d(
+                    TAG,
+                    "Auth state changed uid=${uid ?: "SIGNED_OUT"}"
+                )
+
+                if (uid.isNullOrBlank()) {
+
+                    stopDealListenerOnly()
+                    deals.clear()
+
+                } else {
+
+                    /*
+                     * If the authenticated UID changed, force a fresh
+                     * Firestore listener.
+                     */
+                    if (listeningUid != uid) {
+                        stopDealListenerOnly()
+                    }
+
+                    startListening()
+                }
+            }
+
+        authRegistration = listener
+        auth.addAuthStateListener(listener)
+    }
+
+    /**
+     * Restart the deal listener.
+     */
+    fun restartListening() {
+
+        Log.d(
+            TAG,
+            "restartListening requested"
+        )
+
+        stopDealListenerOnly()
+
+        startListening()
+    }
+
+    /**
+     * Stop only the Firestore deal listener.
+     */
+    private fun stopDealListenerOnly() {
+
+        dealsRegistration?.remove()
+        dealsRegistration = null
+
+        hiddenDealsRegistration?.remove()
+        hiddenDealsRegistration = null
+
+        listening = false
+        listeningUid = null
+    }
+
+    /**
+     * Completely stop DealRepository.
+     */
+    fun stopListening() {
+
+        stopDealListenerOnly()
+
+        hiddenDealsRegistration?.remove()
+        hiddenDealsRegistration = null
+
+        authRegistration?.let { listener ->
+            auth.removeAuthStateListener(listener)
+        }
+
+        authRegistration = null
+
+        deals.clear()
+        hiddenDealIds.clear()
+    }
+
+    // =====================================================================
+    // HIDDEN DEALS
+    // =====================================================================
+
+    /**
+     * Starts listening to the current user's hidden deals collection.
+     */
+    private fun startHiddenDealsListener(uid: String) {
+
+        hiddenDealsRegistration?.remove()
+
+        hiddenDealsRegistration =
+            db.collection("users")
+                .document(uid)
+                .collection("hiddenDeals")
+                .addSnapshotListener { snapshot, error ->
+
+                    if (error != null) {
+
+                        Log.e(
+                            TAG,
+                            "Hidden deals listener failed",
+                            error
+                        )
+
+                        return@addSnapshotListener
+                    }
+
+                    val ids =
+                        snapshot?.documents
+                            ?.map { it.id }
+                            ?: emptyList()
+
+                    hiddenDealIds.clear()
+                    hiddenDealIds.addAll(ids)
+
+                    Log.d(
+                        TAG,
+                        "Hidden deals updated uid=$uid count=${ids.size}"
+                    )
+                }
+    }
+
+    /**
+     * Hides a deal from the current user's list.
+     *
+     * Stores the deal ID in users/{uid}/hiddenDeals/{dealId}.
+     * The deal document itself is NOT deleted.
+     */
+    fun hideDeal(
+        dealId: String,
+        onSuccess: () -> Unit = {},
+        onFailure: (String) -> Unit = {}
+    ) {
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        if (dealId.isBlank()) {
+
+            onFailure(
+                "Invalid deal"
+            )
+
+            return
+        }
+
+        db.collection("users")
+            .document(uid)
+            .collection("hiddenDeals")
+            .document(dealId)
+            .set(
+                mapOf(
+                    "dealId" to dealId,
+                    "hiddenAt" to FieldValue.serverTimestamp()
+                )
+            )
+            .addOnSuccessListener {
+
+                if (
+                    hiddenDealIds.none {
+                        it == dealId
+                    }
+                ) {
+
+                    hiddenDealIds.add(dealId)
+                }
+
+                val index =
+                    deals.indexOfFirst {
+                        it.id == dealId
+                    }
+
+                if (index != -1) {
+                    deals.removeAt(index)
+                }
+
+                Log.d(
+                    TAG,
+                    "Deal hidden id=$dealId"
+                )
+
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+
+                Log.e(
+                    TAG,
+                    "hideDeal failed id=$dealId",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to hide this deal"
+                    )
+                )
+            }
+    }
+
+    /**
+     * Un-hides a deal, returning it to the current user's list.
+     */
+    fun unhideDeal(
+        dealId: String,
+        onSuccess: () -> Unit = {},
+        onFailure: (String) -> Unit = {}
+    ) {
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        if (dealId.isBlank()) {
+
+            onFailure(
+                "Invalid deal"
+            )
+
+            return
+        }
+
+        db.collection("users")
+            .document(uid)
+            .collection("hiddenDeals")
+            .document(dealId)
+            .delete()
+            .addOnSuccessListener {
+
+                hiddenDealIds.remove(dealId)
+
+                restartListening()
+
+                Log.d(
+                    TAG,
+                    "Deal unhidden id=$dealId"
+                )
+
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+
+                Log.e(
+                    TAG,
+                    "unhideDeal failed id=$dealId",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to unhide this deal"
+                    )
+                )
+            }
+    }
+
+    /**
+     * Returns true if the given deal is hidden by the current user.
+     */
+    fun isDealHidden(dealId: String): Boolean {
+
+        return hiddenDealIds.contains(dealId)
+    }
+
+    // =====================================================================
+    // CREATE DEAL
+    // =====================================================================
+
+    /**
+     * Creates a new PENDING deal.
+     *
+     * participantIds:
+     *
+     * [
+     *     senderUid,
+     *     recipientBusinessOwnerUid
+     * ]
+     */
+    fun addDeal(
+        deal: Deal,
+        onSuccess: () -> Unit = {},
+        onFailure: (String) -> Unit = {}
+    ) {
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        Log.d(
+            TAG,
+            "addDeal requested " +
+                "dealId=${deal.id} " +
+                "senderUid=$uid " +
+                "businessId=${deal.businessId}"
+        )
+
+        if (deal.id.isBlank()) {
+
+            onFailure(
+                "Invalid deal"
+            )
+
+            return
+        }
+
+        if (deal.businessId.isBlank()) {
+
+            onFailure(
+                "Please select a business"
+            )
+
+            return
+        }
+
+        if (deal.title.isBlank()) {
+
+            onFailure(
+                "Please enter a deal title"
+            )
+
+            return
+        }
+
+        db.collection(BUSINESSES_COLLECTION)
+            .document(deal.businessId)
+            .get()
+            .addOnSuccessListener { businessDocument ->
+
+                if (!businessDocument.exists()) {
+
+                    Log.w(
+                        TAG,
+                        "Target business does not exist " +
+                            "businessId=${deal.businessId}"
+                    )
+
+                    onFailure(
+                        "The selected business no longer exists"
+                    )
+
+                    return@addOnSuccessListener
+                }
+
+                val ownerId =
+                    businessDocument
+                        .getString("ownerId")
+                        .orEmpty()
+
+                if (ownerId.isBlank()) {
+
+                    Log.e(
+                        TAG,
+                        "Business has no ownerId " +
+                            "businessId=${deal.businessId}"
+                    )
+
+                    onFailure(
+                        "This business has not been configured correctly"
+                    )
+
+                    return@addOnSuccessListener
+                }
+
+                /*
+                 * User cannot send a deal to their own business.
+                 */
+                if (ownerId == uid) {
+
+                    onFailure(
+                        "You cannot send a deal to your own business"
+                    )
+
+                    return@addOnSuccessListener
+                }
+
+                writeNewDeal(
+                    deal = deal,
+                    senderUid = uid,
+                    recipientOwnerUid = ownerId,
+                    onSuccess = onSuccess,
+                    onFailure = onFailure
+                )
+            }
+            .addOnFailureListener { error ->
+
+                Log.e(
+                    TAG,
+                    "Business lookup failed",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to load the selected business"
+                    )
+                )
+            }
+    }
+
+    /**
+     * Writes the actual deal document.
+     */
+    private fun writeNewDeal(
+        deal: Deal,
+        senderUid: String,
+        recipientOwnerUid: String,
+        onSuccess: () -> Unit,
+        onFailure: (String) -> Unit
+    ) {
+
+        /*
+         * Exactly two different USER UIDs.
+         *
+         * NEVER include businessId in participantIds.
+         */
+        val participants =
+            listOf(
+                senderUid,
+                recipientOwnerUid
+            ).distinct()
+
+        if (participants.size != 2) {
+
+            onFailure(
+                "A deal must involve two different business owners"
+            )
+
+            return
+        }
+
+        val now =
+            System.currentTimeMillis()
+
+        val expiresAt =
+            when {
+
+                deal.expiresAt > now + 60_000L ->
+                    deal.expiresAt
+
+                deal.deadline > now + 60_000L ->
+                    deal.deadline
+
+                else ->
+                    now + DEFAULT_DEAL_TTL_MS
+            }
+
+        val timestamp =
+            if (deal.timestamp > 0L) {
+                deal.timestamp
+            } else {
+                now
+            }
+
+        val senderName =
+            deal.senderName
+                .ifBlank {
+
+                    AuthRepository
+                        .currentUser()
+                        ?.displayName
+                        ?.takeIf {
+                            it.isNotBlank()
+                        }
+                        ?: "DealBridge User"
+                }
+
+        val scopedDeal =
+            deal.copy(
+
+                id = deal.id,
+
+                senderId = senderUid,
+
+                senderName = senderName,
+
+                status = DealStatus.PENDING,
+
+                timestamp = timestamp,
+
+                expiresAt = expiresAt,
+
+                participantIds = participants,
+
+                terms =
+                    deal.terms.ifBlank {
+                        "This deal is a proposed business agreement " +
+                            "between the participating businesses. " +
+                            "Both parties agree to complete the transaction " +
+                            "according to the details recorded in DealBridge."
+                    },
+
+                lastActivityAt = now,
+
+                currentStep = 1,
+
+                senderConfirmationStatus =
+                    AgreementConfirmationStatus.REVIEW_TERMS,
+
+                recipientConfirmationStatus =
+                    AgreementConfirmationStatus.REVIEW_TERMS,
+
+                senderAgreedAt = 0L,
+
+                senderConfirmedAt = 0L,
+
+                recipientAgreedAt = 0L,
+
+                recipientConfirmedAt = 0L
+            )
+
+        val data =
+            dealToMap(scopedDeal)
+
+        Log.d(
+            TAG,
+            "Creating deal " +
+                "id=${scopedDeal.id} " +
+                "businessId=${scopedDeal.businessId} " +
+                "sender=$senderUid " +
+                "recipient=$recipientOwnerUid " +
+                "participants=${scopedDeal.participantIds}"
+        )
+
+        db.collection(COLLECTION)
+            .document(scopedDeal.id)
+            .set(data)
+            .addOnSuccessListener {
+
+                Log.d(
+                    TAG,
+                    "Deal created successfully " +
+                        "id=${scopedDeal.id}"
+                )
+
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+
+                Log.e(
+                    TAG,
+                    "Deal creation failed " +
+                        "id=${scopedDeal.id}",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to create deal"
+                    )
+                )
+            }
+    }
+
+    // =====================================================================
+    // ACCEPT
+    // =====================================================================
+
+    fun acceptDeal(
+        id: String,
+        onFailure: (String) -> Unit = {},
+        onSuccess: () -> Unit = {}
+    ) {
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        val index =
+            deals.indexOfFirst {
+                it.id == id
+            }
+
+        if (index == -1) {
+
+            onFailure(
+                "Deal not found in your list. Pull to refresh and try again."
+            )
+
+            return
+        }
+
+        val oldDeal =
+            deals[index]
+
+        if (!isRecipient(oldDeal, uid)) {
+
+            onFailure(
+                "Only the receiving party can accept this deal"
+            )
+
+            return
+        }
+
+        if (oldDeal.status != DealStatus.PENDING) {
+
+            onFailure(
+                "Only pending deals can be accepted"
+            )
+
+            return
+        }
+
+        if (
+            oldDeal.expiresAt > 0L &&
+            oldDeal.expiresAt <= System.currentTimeMillis()
+        ) {
+
+            onFailure(
+                "This deal has expired"
+            )
+
+            return
+        }
+
+        val now =
+            System.currentTimeMillis()
+
+        val updated =
+            oldDeal.copy(
+                status = DealStatus.ACCEPTED,
+                lastActivityAt = now,
+                currentStep = 2
+            )
+
+        deals[index] = updated
+
+        val updates =
+            mapOf<String, Any>(
+                "status" to DealStatus.ACCEPTED,
+                "lastActivityAt" to now,
+                "currentStep" to 2
+            )
+
+        db.collection(COLLECTION)
+            .document(id)
+            .update(updates)
+            .addOnSuccessListener {
+
+                Log.d(
+                    TAG,
+                    "Deal accepted id=$id"
+                )
+
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+
+                if (
+                    index < deals.size &&
+                    deals[index].id == id
+                ) {
+
+                    deals[index] =
+                        oldDeal
+
+                } else {
+
+                    restartListening()
+                }
+
+                Log.e(
+                    TAG,
+                    "acceptDeal failed id=$id",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to accept the deal"
+                    )
+                )
+            }
+    }
+
+    // =====================================================================
+    // DECLINE
+    // =====================================================================
+
+    fun declineDeal(
+        id: String,
+        onFailure: (String) -> Unit = {}
+    ) {
+
+        updateStatus(
+            id = id,
+            newStatus = DealStatus.DECLINED,
+            onFailure = onFailure
+        )
+    }
+
+    // =====================================================================
+    // CANCEL
+    // =====================================================================
+
+    fun cancelDeal(
+        id: String,
+        onSuccess: () -> Unit = {},
+        onFailure: (String) -> Unit = {}
+    ) {
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        val index =
+            deals.indexOfFirst {
+                it.id == id
+            }
+
+        if (index == -1) {
+
+            onFailure(
+                "Deal not found"
+            )
+
+            return
+        }
+
+        val oldDeal =
+            deals[index]
+
+        if (!isParticipant(oldDeal, uid)) {
+
+            onFailure(
+                "You are not a participant in this deal"
+            )
+
+            return
+        }
+
+        if (oldDeal.senderId != uid) {
+
+            onFailure(
+                "Only the sender can cancel this deal"
+            )
+
+            return
+        }
+
+        if (oldDeal.status == DealStatus.COMPLETED) {
+
+            onFailure(
+                "Completed deals cannot be cancelled"
+            )
+
+            return
+        }
+
+        if (oldDeal.status == DealStatus.CANCELLED) {
+
+            onFailure(
+                "This deal is already cancelled"
+            )
+
+            return
+        }
+
+        if (oldDeal.status == DealStatus.EXPIRED) {
+
+            onFailure(
+                "Expired deals cannot be cancelled"
+            )
+
+            return
+        }
+
+        if (oldDeal.status != DealStatus.PENDING) {
+
+            onFailure(
+                "Only pending deals can be cancelled"
+            )
+
+            return
+        }
+
+        if (haveBothConfirmed(oldDeal)) {
+
+            onFailure(
+                "Both parties have confirmed this deal; " +
+                    "it will be completed automatically"
+            )
+
+            return
+        }
+
+        val now =
+            System.currentTimeMillis()
+
+        val updated =
+            oldDeal.copy(
+                status = DealStatus.CANCELLED,
+                lastActivityAt = now
+            )
+
+        /*
+         * Optimistically remove from active UI.
+         */
+        deals.removeAt(index)
+
+        db.collection(COLLECTION)
+            .document(id)
+            .update(
+                mapOf(
+                    "status" to DealStatus.CANCELLED,
+                    "lastActivityAt" to now
+                )
+            )
+            .addOnSuccessListener {
+
+                Log.d(
+                    TAG,
+                    "Deal cancelled id=$id"
+                )
+
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+
+                if (
+                    deals.none {
+                        it.id == oldDeal.id
+                    }
+                ) {
+
+                    val safeIndex =
+                        index.coerceIn(
+                            0,
+                            deals.size
+                        )
+
+                    deals.add(
+                        safeIndex,
+                        oldDeal
+                    )
+                }
+
+                Log.e(
+                    TAG,
+                    "cancelDeal failed id=$id",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to cancel the deal"
+                    )
+                )
+            }
+    }
+
+
+    // =====================================================================
+    // CONFIRM
+    // =====================================================================
+
+    fun confirmDeal(
+        id: String,
+        onFailure: (String) -> Unit = {},
+        onSuccess: () -> Unit = {}
+    ) {
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        val index =
+            deals.indexOfFirst {
+                it.id == id
+            }
+
+        if (index == -1) {
+
+            onFailure(
+                "Deal not found"
+            )
+
+            return
+        }
+
+        val oldDeal =
+            deals[index]
+
+        if (!isParticipant(oldDeal, uid)) {
+
+            onFailure(
+                "You are not a participant in this deal"
+            )
+
+            return
+        }
+
+        if (
+            oldDeal.status != DealStatus.PENDING &&
+            oldDeal.status != DealStatus.ACCEPTED &&
+            oldDeal.status != DealStatus.ACTIVE
+        ) {
+
+            onFailure(
+                "This deal can no longer be confirmed"
+            )
+
+            return
+        }
+
+        val sender =
+            isSender(
+                oldDeal,
+                uid
+            )
+
+        val myStatus =
+            if (sender) {
+                oldDeal.senderConfirmationStatus
+            } else {
+                oldDeal.recipientConfirmationStatus
+            }
+
+        if (
+            myStatus ==
+            AgreementConfirmationStatus.CONFIRMED
+        ) {
+
+            onFailure(
+                "You have already confirmed this deal"
+            )
+
+            return
+        }
+
+        if (
+            myStatus !=
+                AgreementConfirmationStatus.REVIEW_TERMS &&
+            myStatus !=
+                AgreementConfirmationStatus.AGREED
+        ) {
+
+            onFailure(
+                "This deal is not ready for confirmation"
+            )
+
+            return
+        }
+
+        val now =
+            System.currentTimeMillis()
+
+        val wasReviewing =
+            myStatus ==
+                AgreementConfirmationStatus.REVIEW_TERMS
+
+        val updated =
+            if (sender) {
+
+                oldDeal.copy(
+
+                    senderConfirmationStatus =
+                        AgreementConfirmationStatus.CONFIRMED,
+
+                    senderAgreedAt =
+                        if (wasReviewing) {
+                            now
+                        } else {
+                            oldDeal.senderAgreedAt
+                        },
+
+                    senderConfirmedAt =
+                        now,
+
+                    lastActivityAt =
+                        now,
+
+                    currentStep =
+                        3
+                )
+
+            } else {
+
+                oldDeal.copy(
+
+                    recipientConfirmationStatus =
+                        AgreementConfirmationStatus.CONFIRMED,
+
+                    recipientAgreedAt =
+                        if (wasReviewing) {
+                            now
+                        } else {
+                            oldDeal.recipientAgreedAt
+                        },
+
+                    recipientConfirmedAt =
+                        now,
+
+                    lastActivityAt =
+                        now,
+
+                    currentStep =
+                        3
+                )
+            }
+
+        deals[index] =
+            updated
+
+        val updates =
+            mutableMapOf<String, Any>(
+                "lastActivityAt" to now,
+                "currentStep" to 3
+            )
+
+        if (sender) {
+
+            updates[
+                "senderConfirmationStatus"
+            ] =
+                AgreementConfirmationStatus.CONFIRMED
+
+            updates[
+                "senderConfirmedAt"
+            ] =
+                now
+
+            if (wasReviewing) {
+
+                updates[
+                    "senderAgreedAt"
+                ] =
+                    now
+            }
+
+        } else {
+
+            updates[
+                "recipientConfirmationStatus"
+            ] =
+                AgreementConfirmationStatus.CONFIRMED
+
+            updates[
+                "recipientConfirmedAt"
+            ] =
+                now
+
+            if (wasReviewing) {
+
+                updates[
+                    "recipientAgreedAt"
+                ] =
+                    now
+            }
+        }
+
+        db.collection(COLLECTION)
+            .document(id)
+            .update(updates)
+            .addOnSuccessListener {
+
+                Log.d(
+                    TAG,
+                    "Deal confirmed " +
+                        "id=$id " +
+                        "sender=$sender " +
+                        "wasReviewing=$wasReviewing"
+                )
+
+                /*
+                 * NEVER write COMPLETED here.
+                 *
+                 * Backend is responsible for completion once both
+                 * participants are confirmed.
+                 */
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+
+                if (
+                    index < deals.size &&
+                    deals[index].id == id
+                ) {
+
+                    deals[index] =
+                        oldDeal
+
+                } else {
+
+                    restartListening()
+                }
+
+                Log.e(
+                    TAG,
+                    "confirmDeal failed id=$id",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to confirm the deal"
+                    )
+                )
+            }
+    }
+
+    // =====================================================================
+    // STATUS
+    // =====================================================================
+
+    fun updateStatus(
+        id: String,
+        newStatus: String,
+        onFailure: (String) -> Unit = {},
+        onSuccess: () -> Unit = {}
+    ) {
+
+        /*
+         * Client-authorized statuses only.
+         *
+         * COMPLETED
+         * CANCELLED
+         * EXPIRED
+         *
+         * remain server authoritative.
+         */
+        if (
+            newStatus != DealStatus.PENDING &&
+            newStatus != DealStatus.ACCEPTED &&
+            newStatus != DealStatus.DECLINED
+        ) {
+
+            onFailure(
+                "This status is controlled by the DealBridge server"
+            )
+
+            return
+        }
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        val index =
+            deals.indexOfFirst {
+                it.id == id
+            }
+
+        if (index == -1) {
+
+            onFailure(
+                "Deal not found in your list. Pull to refresh and try again."
+            )
+
+            return
+        }
+
+        val oldDeal =
+            deals[index]
+
+        if (!isParticipant(oldDeal, uid)) {
+
+            onFailure(
+                "You are not a participant in this deal"
+            )
+
+            return
+        }
+
+        if (
+            oldDeal.status == DealStatus.COMPLETED ||
+            oldDeal.status == DealStatus.CANCELLED ||
+            oldDeal.status == DealStatus.EXPIRED
+        ) {
+
+            onFailure(
+                "This deal can no longer be changed"
+            )
+
+            return
+        }
+
+        /*
+         * ACCEPTED and DECLINED can only be performed by recipient.
+         */
+        if (
+            newStatus == DealStatus.ACCEPTED ||
+            newStatus == DealStatus.DECLINED
+        ) {
+
+            if (!isRecipient(oldDeal, uid)) {
+
+                onFailure(
+                    "Only the receiving party can respond to this deal"
+                )
+
+                return
+            }
+        }
+
+        if (
+            newStatus == DealStatus.ACCEPTED &&
+            oldDeal.status != DealStatus.PENDING
+        ) {
+
+            onFailure(
+                "Only pending deals can be accepted"
+            )
+
+            return
+        }
+
+        if (
+            newStatus == DealStatus.DECLINED &&
+            oldDeal.status != DealStatus.PENDING
+        ) {
+
+            onFailure(
+                "Only pending deals can be declined"
+            )
+
+            return
+        }
+
+        if (haveBothConfirmed(oldDeal)) {
+
+            onFailure(
+                "Both parties have confirmed this deal; " +
+                    "it will be completed automatically"
+            )
+
+            return
+        }
+
+        val now =
+            System.currentTimeMillis()
+
+        val newStep =
+            when (newStatus) {
+
+                DealStatus.ACCEPTED ->
+                    2
+
+                else ->
+                    oldDeal.currentStep
+            }
+
+        val updated =
+            oldDeal.copy(
+                status = newStatus,
+                lastActivityAt = now,
+                currentStep = newStep
+            )
+
+        deals[index] =
+            updated
+
+        val updates =
+            mapOf<String, Any>(
+                "status" to newStatus,
+                "lastActivityAt" to now,
+                "currentStep" to newStep
+            )
+
+        db.collection(COLLECTION)
+            .document(id)
+            .update(updates)
+            .addOnSuccessListener {
+
+                Log.d(
+                    TAG,
+                    "Deal status changed " +
+                        "id=$id " +
+                        "status=$newStatus"
+                )
+
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+
+                if (
+                    index < deals.size &&
+                    deals[index].id == id
+                ) {
+
+                    deals[index] =
+                        oldDeal
+
+                } else {
+
+                    restartListening()
+                }
+
+                Log.e(
+                    TAG,
+                    "updateStatus failed " +
+                        "id=$id " +
+                        "status=$newStatus",
+                    error
+                )
+
+                onFailure(
+                    firestoreErrorMessage(
+                        error,
+                        "Unable to update the deal"
+                    )
+                )
+            }
+    }
+
+    // =====================================================================
+    // EXPIRY
+    // =====================================================================
+
+    /**
+     * Expiry remains server authoritative.
+     */
+    fun expireDeal(
+        id: String,
+        onFailure: (String) -> Unit = {}
+    ) {
+
+        Log.d(
+            TAG,
+            "expireDeal ignored: server authoritative id=$id"
+        )
+
+        onFailure(
+            "Deal expiry is handled automatically by DealBridge"
+        )
+    }
+
+    /**
+     * Display-only expiry.
+     *
+     * Does NOT write EXPIRED to Firestore.
+     */
+    private fun reconcileDisplayExpiry(
+        deal: Deal
+    ): Deal {
+
+        val now =
+            System.currentTimeMillis()
+
+        if (
+            deal.status == DealStatus.PENDING &&
+            deal.expiresAt > 0L &&
+            deal.expiresAt <= now
+        ) {
+
+            return deal.copy(
+                status = DealStatus.EXPIRED
+            )
+        }
+
+        return deal
+    }
+
+    // =====================================================================
+    // PARTICIPANTS
+    // =====================================================================
+
+    fun isParticipant(
+        deal: Deal
+    ): Boolean {
+
+        val uid =
+            currentUid()
+
+        if (uid.isBlank()) {
+            return false
+        }
+
+        return isParticipant(
+            deal,
+            uid
+        )
+    }
+
+    private fun isParticipant(
+        deal: Deal,
+        uid: String
+    ): Boolean {
+
+        if (uid.isBlank()) {
+            return false
+        }
+
+        if (deal.senderId.isBlank()) {
+            return false
+        }
+
+        if (deal.participantIds.size != 2) {
+            return false
+        }
+
+        if (
+            deal.participantIds.distinct().size != 2
+        ) {
+            return false
+        }
+
+        if (
+            !deal.participantIds.contains(
+                deal.senderId
+            )
+        ) {
+            return false
+        }
+
+        return deal.participantIds.contains(uid)
+    }
+
+    private fun isSender(
+        deal: Deal,
+        uid: String
+    ): Boolean {
+
+        return uid.isNotBlank() &&
+            deal.senderId == uid &&
+            isParticipant(
+                deal,
+                uid
+            )
+    }
+
+    private fun isRecipient(
+        deal: Deal,
+        uid: String
+    ): Boolean {
+
+        if (uid.isBlank()) {
+            return false
+        }
+
+        if (!isParticipant(deal, uid)) {
+            return false
+        }
+
+        if (deal.senderId == uid) {
+            return false
+        }
+
+        /*
+         * Exactly two participants means the other UID is the recipient.
+         */
+        return true
+    }
+
+    // =====================================================================
+    // AGREEMENT HELPERS
+    // =====================================================================
+
+    fun haveBothAgreed(
+        deal: Deal
+    ): Boolean {
+
+        return deal.senderConfirmationStatus ==
+            AgreementConfirmationStatus.AGREED &&
+
+            deal.recipientConfirmationStatus ==
+            AgreementConfirmationStatus.AGREED
+    }
+
+    fun haveBothConfirmed(
+        deal: Deal
+    ): Boolean {
+
+        return deal.senderConfirmationStatus ==
+            AgreementConfirmationStatus.CONFIRMED &&
+
+            deal.recipientConfirmationStatus ==
+            AgreementConfirmationStatus.CONFIRMED
+    }
+
+    private fun bothConfirmedServerSide(
+        deal: Deal
+    ): Boolean {
+
+        return haveBothConfirmed(deal)
+    }
+
+    // =====================================================================
+    // DELETE
+    // =====================================================================
+
+    fun deleteDeal(
+        id: String,
+        onFailure: (String) -> Unit = {}
+    ) {
+
+        val uid =
+            requireUid(onFailure)
+                ?: return
+
+        val current =
+            deals.firstOrNull {
+                it.id == id
+            }
+
+        if (current == null) {
+
+            onFailure(
+                "Deal not found"
+            )
+
+            return
+        }
+
+        if (!isParticipant(current, uid)) {
+
+            onFailure(
+                "You are not a participant in this deal"
+            )
+
+            return
+        }
+
+        if (current.status == DealStatus.COMPLETED) {
+
+            onFailure(
+                "Completed deals cannot be deleted"
+            )
+
+            return
+        }
+
+        if (current.status != DealStatus.CANCELLED) {
+
+            onFailure(
+                "Cancel the deal instead of deleting it"
+            )
+
+            return
+        }
+
+        onFailure(
+            "Cancelled deals are retained for record keeping"
+        )
+    }
+
+    // =====================================================================
+    // GET DEAL
+    // =====================================================================
+
+    fun getDealById(
+        id: String
+    ): Deal? {
+
+        return deals.firstOrNull {
+            it.id == id
+        }
+    }
+
+    // =====================================================================
+    // DIAGNOSTICS
+    // =====================================================================
+
+    /**
+     * Diagnostic helper for receiver-not-seeing-deal problems.
+     */
+    fun logReceiverTrace(
+        dealId: String
+    ) {
+
+        val uid =
+            currentUid()
+
+        Log.d(
+            TAG,
+            "TRACE START deal=$dealId receiverUid=$uid"
+        )
+
+        if (uid.isBlank()) {
+
+            Log.w(
+                TAG,
+                "TRACE ABORT: no authenticated Firebase user"
+            )
+
+            return
+        }
+
+        db.collection(COLLECTION)
+            .document(dealId)
+            .get()
+            .addOnSuccessListener { document ->
+
+                if (!document.exists()) {
+
+                    Log.w(
+                        TAG,
+                        "TRACE: deal does not exist id=$dealId"
+                    )
+
+                    return@addOnSuccessListener
+                }
+
+                val participantIds =
+                    readStringList(
+                        document,
+                        "participantIds"
+                    )
+
+                val status =
+                    document
+                        .getString("status")
+                        .orEmpty()
+
+                val senderId =
+                    document
+                        .getString("senderId")
+                        .orEmpty()
+
+                val businessId =
+                    document
+                        .getString("businessId")
+                        .orEmpty()
+
+                val containsReceiver =
+                    participantIds.contains(uid)
+
+                val participantCount =
+                    participantIds.distinct().size
+
+                Log.d(
+                    TAG,
+                    "TRACE: " +
+                        "exists=true " +
+                        "status=$status " +
+                        "sender=$senderId " +
+                        "business=$businessId " +
+                        "participants=$participantIds " +
+                        "participantCount=$participantCount " +
+                        "containsReceiver=$containsReceiver"
+                )
+
+                if (!containsReceiver) {
+
+                    Log.e(
+                        TAG,
+                        "TRACE FAILURE: authenticated receiver " +
+                            "UID is not in participantIds"
+                    )
+                }
+
+                if (participantCount != 2) {
+
+                    Log.e(
+                        TAG,
+                        "TRACE FAILURE: participantIds must contain " +
+                            "exactly two different user UIDs"
+                    )
+                }
+
+                val visibleInUi =
+                    deals.any {
+                        it.id == dealId
+                    }
+
+                Log.d(
+                    TAG,
+                    "TRACE: visibleInUi=$visibleInUi"
+                )
+            }
+            .addOnFailureListener { error ->
+
+                Log.e(
+                    TAG,
+                    "TRACE: direct Firestore read failed",
+                    error
+                )
+            }
+    }
+
+    // =====================================================================
+    // CLEAR
+    // =====================================================================
+
+    fun clearDeals() {
+        deals.clear()
+    }
+
+    // =====================================================================
+    // FIRESTORE MAPPING
+    // =====================================================================
+
+    private fun dealToMap(
+        deal: Deal
+    ): Map<String, Any?> {
+
+        return mapOf(
+
+            "id" to deal.id,
+
+            "businessId" to deal.businessId,
+
+            "businessName" to deal.businessName,
+
+            "title" to deal.title,
+
+            "description" to deal.description,
+
+            "value" to deal.value,
+
+            "senderId" to deal.senderId,
+
+            "senderName" to deal.senderName,
+
+            "status" to deal.status,
+
+            "createdAt" to deal.createdAt,
+
+            "timestamp" to deal.timestamp,
+
+            "deadline" to deal.deadline,
+
+            "expiresAt" to deal.expiresAt,
+
+            "participantIds" to deal.participantIds,
+
+            "senderConfirmationStatus" to
+                deal.senderConfirmationStatus,
+
+            "senderAgreedAt" to
+                deal.senderAgreedAt,
+
+            "senderConfirmedAt" to
+                deal.senderConfirmedAt,
+
+            "recipientConfirmationStatus" to
+                deal.recipientConfirmationStatus,
+
+            "recipientAgreedAt" to
+                deal.recipientAgreedAt,
+
+            "recipientConfirmedAt" to
+                deal.recipientConfirmedAt,
+
+            "terms" to deal.terms,
+
+            "lastActivityAt" to
+                deal.lastActivityAt,
+
+            "currentStep" to
+                deal.currentStep
+        )
+    }
+
+    // =====================================================================
+    // PARSING
+    // =====================================================================
+
+    private fun parseDeal(
+        document: DocumentSnapshot
+    ): Deal? {
+
+        if (!document.exists()) {
+            return null
+        }
+
+        return try {
+
+            val parsed =
+                document.toObject(
+                    Deal::class.java
+                )
+
+            if (parsed == null) {
+
+                tolerantParseDeal(document)
+
+            } else if (parsed.id.isBlank()) {
+
+                parsed.copy(
+                    id = document.id
+                )
+
+            } else {
+
+                parsed
+            }
+
+        } catch (error: Exception) {
+
+            Log.w(
+                TAG,
+                "Normal Deal parsing failed for " +
+                    "${document.id}; using tolerant parser",
+                error
+            )
+
+            tolerantParseDeal(document)
+        }
+    }
+
+    /**
+     * Tolerant parser.
+     *
+     * Supports:
+     * - Long
+     * - Double
+     * - Integer
+     * - Timestamp
+     * - String timestamps
+     * - missing fields
+     */
+    private fun tolerantParseDeal(
+        document: DocumentSnapshot
+    ): Deal? {
+
+        return try {
+
+            val data =
+                document.data
+                    ?: return null
+
+            fun string(
+                key: String
+            ): String {
+
+                return data[key] as? String ?: ""
+            }
+
+            fun long(
+                key: String
+            ): Long {
+
+                return when (
+                    val value = data[key]
+                ) {
+
+                    is Timestamp ->
+                        value.toDate().time
+
+                    is Number ->
+                        value.toLong()
+
+                    is String ->
+                        value.toLongOrNull() ?: 0L
+
+                    else ->
+                        0L
+                }
+            }
+
+            fun integer(
+                key: String
+            ): Int {
+
+                return when (
+                    val value = data[key]
+                ) {
+
+                    is Number ->
+                        value.toInt()
+
+                    is String ->
+                        value.toIntOrNull() ?: 0
+
+                    else ->
+                        0
+                }
+            }
+
+            val participantIds =
+                readStringList(
+                    document,
+                    "participantIds"
+                )
+
+            Deal(
+
+                id =
+                    string("id")
+                        .ifBlank {
+                            document.id
+                        },
+
+                businessId =
+                    string("businessId"),
+
+                businessName =
+                    string("businessName"),
+
+                title =
+                    string("title"),
+
+                description =
+                    string("description"),
+
+                value =
+                    string("value"),
+
+                senderId =
+                    string("senderId"),
+
+                senderName =
+                    string("senderName"),
+
+                status =
+                    string("status")
+                        .ifBlank {
+                            DealStatus.PENDING
+                        },
+
+                createdAt =
+                    string("createdAt")
+                        .ifBlank {
+                            "Just now"
+                        },
+
+                timestamp =
+                    long("timestamp")
+                        .takeIf {
+                            it > 0L
+                        }
+                        ?: System.currentTimeMillis(),
+
+                deadline =
+                    long("deadline"),
+
+                expiresAt =
+                    long("expiresAt"),
+
+                completedAt =
+                    long("completedAt"),
+
+                acceptedAt =
+                    long("acceptedAt"),
+
+                completedDate =
+                    string("completedDate"),
+
+                flagged =
+                    data["flagged"] as? Boolean
+                        ?: false,
+
+                flagReasons =
+                    readStringList(
+                        document,
+                        "flagReasons"
+                    ),
+
+                flaggedAt =
+                    long("flaggedAt"),
+
+                participantIds =
+                    participantIds,
+
+                disputeStatus =
+                    string("disputeStatus"),
+
+                disputeId =
+                    string("disputeId"),
+
+                qrToken =
+                    string("qrToken"),
+
+                qrGeneratedAt =
+                    long("qrGeneratedAt"),
+
+                qrInvalidatedAt =
+                    long("qrInvalidatedAt"),
+
+                qrScannedAt =
+                    long("qrScannedAt"),
+
+                qrScannedByBusinessId =
+                    string("qrScannedByBusinessId"),
+
+                senderConfirmationStatus =
+                    string("senderConfirmationStatus")
+                        .ifBlank {
+                            AgreementConfirmationStatus.REVIEW_TERMS
+                        },
+
+                senderAgreedAt =
+                    long("senderAgreedAt"),
+
+                senderConfirmedAt =
+                    long("senderConfirmedAt"),
+
+                recipientConfirmationStatus =
+                    string("recipientConfirmationStatus")
+                        .ifBlank {
+                            AgreementConfirmationStatus.REVIEW_TERMS
+                        },
+
+                recipientAgreedAt =
+                    long("recipientAgreedAt"),
+
+                recipientConfirmedAt =
+                    long("recipientConfirmedAt"),
+
+                terms =
+                    string("terms"),
+
+                lastActivityAt =
+                    long("lastActivityAt"),
+
+                currentStep =
+                    integer("currentStep")
+                        .takeIf {
+                            it > 0
+                        }
+                        ?: 1
+            )
+
+        } catch (error: Exception) {
+
+            Log.e(
+                TAG,
+                "Tolerant Deal parsing failed " +
+                    "id=${document.id}",
+                error
+            )
+
+            null
+        }
+    }
+
+    private fun readStringList(
+        document: DocumentSnapshot,
+        key: String
+    ): List<String> {
+
+        val value =
+            document.get(key)
+
+        return when (value) {
+
+            is List<*> ->
+                value.filterIsInstance<String>()
+
+            else ->
+                emptyList()
+        }
+    }
+
+    // =====================================================================
+    // ERROR HANDLING
+    // =====================================================================
+
+    private fun firestoreErrorMessage(
+        error: Exception,
+        defaultMessage: String
+    ): String {
+
+        val firestoreError =
+            error as? FirebaseFirestoreException
+
+        return when (firestoreError?.code) {
+
+            FirebaseFirestoreException.Code.UNAUTHENTICATED ->
+                "Your session has expired. Please sign in again."
+
+            FirebaseFirestoreException.Code.PERMISSION_DENIED ->
+                "You do not have permission to perform this action."
+
+            FirebaseFirestoreException.Code.NOT_FOUND ->
+                "The requested deal or business no longer exists."
+
+            FirebaseFirestoreException.Code.UNAVAILABLE ->
+                "Network error. Please check your connection and try again."
+
+            FirebaseFirestoreException.Code.FAILED_PRECONDITION ->
+                "This deal can no longer be changed."
+
+            FirebaseFirestoreException.Code.ALREADY_EXISTS ->
+                "This deal already exists."
+
+            else -> {
+
+                val message =
+                    error.message.orEmpty()
+
+                when {
+
+                    message.contains(
+                        "permission",
+                        ignoreCase = true
+                    ) ->
+                        "You do not have permission to perform this action."
+
+                    message.contains(
+                        "unauthenticated",
+                        ignoreCase = true
+                    ) ->
+                        "Your session has expired. Please sign in again."
+
+                    message.contains(
+                        "network",
+                        ignoreCase = true
+                    ) ->
+                        "Network error. Please check your connection and try again."
+
+                    message.contains(
+                        "already exists",
+                        ignoreCase = true
+                    ) ->
+                        "This deal already exists."
+
+                    else ->
+                        message.ifBlank {
+                            defaultMessage
+                        }
+                }
+            }
+        }
+    }
+
+}
